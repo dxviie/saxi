@@ -7,6 +7,7 @@
 
 import http from "node:http";
 import type { AddressInfo } from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { autoDetect } from "@serialport/bindings-cpp";
@@ -17,10 +18,13 @@ import express from "express";
 import type WebSocket from "ws";
 import { WebSocketServer } from "ws";
 import { createMockSerialPort } from "./__tests__/mocks/serialport.js";
+import { mountCameraRoutes } from "./camera-routes.js";
+import { CameraManager } from "./camera.js";
 import { EBB, type EBBPort, type Hardware } from "./ebb.js";
 import { type Motion, PenMotion, Plan } from "./planning.js";
 import { SerialPortSerialPort } from "./serialport-serialport.js";
 import * as _self from "./server.js"; // use self-import for test mocking
+import { TimelapseRecorder } from "./timelapse.js";
 import { formatDuration } from "./util.js";
 
 type Com = string;
@@ -37,6 +41,11 @@ const getDeviceInfo = (ebb: EBB | null, _com: Com) => {
   return { path: portPath, hardware: ebb?.hardware };
 };
 
+/** Where saxi keeps camera settings and timelapse recordings unless told otherwise. */
+export function defaultDataDir(): string {
+  return process.env.SAXI_DATA_DIR || path.join(os.homedir(), ".saxi");
+}
+
 /**
  * Start the express server.
  * @param port
@@ -44,6 +53,7 @@ const getDeviceInfo = (ebb: EBB | null, _com: Com) => {
  * @param com
  * @param enableCors
  * @param maxPayloadSize
+ * @param dataDir directory for camera settings and timelapse recordings
  * @returns
  */
 export async function startServer(
@@ -52,6 +62,7 @@ export async function startServer(
   com: Com = "",
   enableCors = false,
   maxPayloadSize = "200mb",
+  dataDir: string = defaultDataDir(),
 ) {
   const app = express();
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -60,6 +71,9 @@ export async function startServer(
   if (enableCors) {
     app.use(cors());
   }
+  // Cameras and timelapse recording (see camera.ts / timelapse.ts)
+  const cameras = new CameraManager(dataDir);
+  const timelapse = new TimelapseRecorder(cameras, dataDir);
   // Web and Socket server
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server });
@@ -72,6 +86,8 @@ export async function startServer(
   let currentPlan: Plan | null = null;
   let plotting = false;
   let controller: AbortController | null = null;
+
+  mountCameraRoutes(app, cameras, timelapse, () => plotting);
 
   wss.on("connection", (ws) => {
     clients.push(ws);
@@ -253,12 +269,14 @@ export async function startServer(
     motionIdx = 0;
 
     const firstPenMotion = plan.motions.find((x) => x instanceof PenMotion) as PenMotion;
+    await timelapse.plotStarted(plan.duration()); // captures the blank page before anything moves
     await plotter.prePlot(firstPenMotion.initialPos);
 
     let penIsUp = true;
     try {
       for (const motion of plan.motions) {
         broadcast({ c: "progress", p: { motionIdx } });
+        timelapse.plotMotion(motion);
 
         await Promise.race([plotter.executeMotion(motion, [motionIdx, plan.motions.length]), abortPromise]);
 
@@ -286,6 +304,7 @@ export async function startServer(
       motionIdx = null;
       currentPlan = null;
       await plotter.postPlot();
+      await timelapse.plotEnded(signal.aborted); // final frame of the finished drawing
     }
   }
 
@@ -295,6 +314,11 @@ export async function startServer(
       signal.addEventListener("abort", () => reject(new Error("Aborted")), { once: true });
     });
   }
+
+  server.on("close", () => {
+    timelapse.close();
+    cameras.close();
+  });
 
   return new Promise<http.Server>((resolve) => {
     server.listen(port, () => {

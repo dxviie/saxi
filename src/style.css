@@ -446,3 +446,465 @@ summary:focus {
   text-align: center;
   color: var(--red);
 }
+
+
+/* VIEW TABS (plot / camera) */
+
+.view-tabs {
+  display: flex;
+  margin: 0.25rem 1rem 0.5rem;
+  border: 1px solid var(--purple-light);
+}
+
+.view-tab {
+  flex: 1;
+  margin: 0;
+  padding: 0.25rem;
+  border: none;
+  box-shadow: none;
+  font-size: 12px;
+  color: var(--purple);
+  background-color: white;
+}
+.view-tab + .view-tab {
+  border-left: 1px solid var(--purple-light);
+}
+.view-tab--active {
+  color: white;
+  background-color: var(--purple);
+}
+.view-tab:not(:disabled):hover,
+.view-tab:not(:disabled):focus {
+  box-shadow: none;
+}
+.view-tab--active:not(:disabled):active {
+  color: white;
+  background-color: var(--purple-dark);
+}
+
+/* CAMERA VIEW */
+
+.camera-root .control-panel {
+  z-index: 1;
+}
+
+.camera-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 1rem 1.5rem 3rem;
+  overflow-y: auto;
+}
+
+.camera-hint {
+  font-size: 10px;
+  color: var(--purple);
+  opacity: 0.8;
+}
+
+.camera-main__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin: 1rem 0 0.75rem;
+  gap: 1rem;
+}
+.camera-main__header h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 900;
+}
+.camera-main__header .camera-hint {
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+label.inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 12px;
+}
+label.inline select,
+label.inline input[type=number] {
+  width: auto;
+  min-width: 4rem;
+  margin: 0;
+  height: 28px;
+  padding: 0.2rem 0.4rem;
+}
+
+.camera-banner {
+  margin-bottom: 1rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid var(--purple-light);
+  background-color: var(--purple-light);
+  color: var(--purple-dark);
+}
+.camera-banner--error {
+  border-color: var(--red);
+  background-color: #fbe9e9;
+  color: var(--red);
+}
+.camera-banner code {
+  font-family: monospace;
+}
+
+.camera-empty {
+  padding: 2rem;
+  border: 1px dashed var(--purple-light);
+  text-align: center;
+  color: var(--purple);
+}
+.camera-empty p {
+  max-width: 48rem;
+  margin: 0.5rem auto;
+}
+
+/* live view grid */
+
+.camera-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 1rem;
+}
+.camera-grid--1 {
+  grid-template-columns: minmax(340px, 1200px);
+}
+
+.camera-card {
+  background-color: white;
+  box-shadow: 3px 3px 15px rgba(0, 0, 0, 0.2);
+}
+.camera-card--disabled {
+  opacity: 0.6;
+}
+
+.camera-frame {
+  position: relative;
+  background-color: #222;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.camera-frame__canvas {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  width: auto;
+  height: 100%;
+  object-fit: contain;
+}
+.camera-frame__canvas--empty {
+  visibility: hidden;
+}
+.camera-frame__overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  text-align: center;
+  color: whitesmoke;
+  font-weight: bold;
+  background: rgba(0, 0, 0, 0.35);
+}
+.camera-frame__overlay--error {
+  color: #ffb3b3;
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.camera-card__bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  font-size: 12px;
+}
+.camera-card__detail {
+  margin-left: 0.5rem;
+  opacity: 0.7;
+}
+.camera-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+.camera-card__error {
+  padding: 0 0.75rem 0.5rem;
+  font-size: 11px;
+  color: var(--red);
+}
+
+button.small {
+  width: auto;
+  margin: 0;
+  padding: 0.2rem 0.6rem;
+  font-size: 12px;
+}
+button.danger {
+  color: var(--red);
+  border-color: var(--red);
+}
+button.danger:not(:disabled):active {
+  color: var(--red);
+}
+a.button-like {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--purple);
+  text-decoration: none;
+}
+a.button-like:hover {
+  text-decoration: underline;
+}
+
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 0.4rem;
+  border-radius: 50%;
+  background-color: var(--purple-light);
+  vertical-align: middle;
+}
+.status-dot--live { background-color: var(--teal); }
+.status-dot--starting { background-color: var(--purple); animation: pulse 1s infinite alternate; }
+.status-dot--error { background-color: var(--red); }
+.status-dot--recording { background-color: var(--red); animation: pulse 1s infinite alternate; }
+
+@keyframes pulse {
+  from { opacity: 1; }
+  to { opacity: 0.3; }
+}
+
+/* control panel: cameras & settings */
+
+.camera-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.camera-row .flex-checkbox {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.camera-row input[type=checkbox],
+.camera-row .status-dot {
+  flex-shrink: 0;
+}
+.camera-row .camera-row__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.camera-row .button-link {
+  width: auto;
+  flex-shrink: 0;
+  margin-left: 0.5rem;
+}
+.camera-row label {
+  font-size: 12px;
+  text-align: left;
+}
+
+.camera-form {
+  margin: 0.5rem 0;
+  padding: 0.5rem;
+  border: 1px solid var(--purple-light);
+}
+.camera-form label {
+  display: block;
+}
+.camera-form__help {
+  margin: -0.25rem 0 0.5rem;
+  font-size: 10px;
+  line-height: 1.4;
+  opacity: 0.8;
+}
+.camera-form__error {
+  margin: 0.25rem 0 0.5rem;
+  font-size: 11px;
+  color: var(--red);
+}
+
+.camera-subheader {
+  margin-bottom: 0.5rem;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.section-body label {
+  display: block;
+}
+.section-body label.flex-checkbox,
+.section-body label.inline {
+  display: flex;
+}
+.section-body label.inline {
+  display: inline-flex;
+}
+
+.recording-status {
+  margin-bottom: 0.5rem;
+  text-align: center;
+}
+
+.record-button {
+  color: white;
+  background-color: var(--red);
+  border: 1px solid var(--red);
+}
+.record-button:not(:disabled):active {
+  color: white;
+  background-color: var(--red);
+}
+.record-button:disabled {
+  color: var(--purple-light);
+  background-color: white;
+  border-color: var(--purple-light);
+  cursor: default;
+}
+
+/* timelapse library */
+
+.timelapse-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.timelapse-card {
+  display: flex;
+  background-color: white;
+  box-shadow: 3px 3px 15px rgba(0, 0, 0, 0.2);
+}
+.timelapse-card--recording {
+  border-left: 4px solid var(--red);
+}
+
+.timelapse-card__thumb {
+  flex: 0 0 220px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: #222;
+  overflow: hidden;
+}
+.timelapse-card__thumb img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+.timelapse-card__nothumb {
+  padding: 2rem;
+  color: whitesmoke;
+  font-size: 12px;
+}
+
+.timelapse-card__body {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.75rem 1rem;
+}
+.timelapse-card__title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 16px;
+}
+.timelapse-card__status {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.7;
+}
+.timelapse-card__meta {
+  margin: 0.25rem 0 0.5rem;
+  font-size: 11px;
+  opacity: 0.8;
+}
+.timelapse-card__renders {
+  margin: 0.5rem 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+.timelapse-card__renders li {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.15rem 0;
+}
+.timelapse-card__renders a {
+  color: var(--purple-dark);
+}
+.timelapse-card__renders .button-link {
+  display: inline;
+  width: auto;
+  font-size: 12px;
+  font-weight: 700;
+}
+.timelapse-card__size {
+  opacity: 0.6;
+}
+.timelapse-card__video {
+  display: block;
+  width: 100%;
+  max-height: 60vh;
+  margin: 0.5rem 0;
+  background-color: black;
+}
+.timelapse-card__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+.render-jobs {
+  margin: 0.5rem 0;
+  font-size: 11px;
+}
+.render-job {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.2rem 0;
+}
+.render-job--error {
+  color: var(--red);
+}
+.render-job__bar {
+  flex: 1 1 auto;
+  height: 6px;
+  max-width: 240px;
+  background-color: var(--purple-light);
+  overflow: hidden;
+}
+.render-job__bar > span {
+  display: block;
+  height: 100%;
+  background-color: var(--teal);
+  transition: width 0.5s;
+}
+
+@media (max-width: 800px) {
+  .timelapse-card {
+    flex-direction: column;
+  }
+  .timelapse-card__thumb {
+    flex-basis: auto;
+    max-height: 200px;
+  }
+}

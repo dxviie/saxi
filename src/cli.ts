@@ -11,7 +11,7 @@ import type { Hardware } from "./ebb.js";
 import { replan } from "./massager.js";
 import { PaperSize } from "./paper-size.js";
 import { Device, defaultPlanOptions, type PlanOptions } from "./planning.js";
-import { connectEBB, startServer } from "./server.js";
+import { connectEBB, defaultDataDir, startServer } from "./server.js";
 import { formatDuration } from "./util.js";
 
 function parseSvg(svg: string) {
@@ -267,9 +267,21 @@ export function cli(argv: string[]): void {
           .option("max-payload-size", {
             describe: "maximum payload size to accept",
             default: "200mb",
+          })
+          .option("data-dir", {
+            describe: "directory for camera settings and timelapse recordings",
+            default: defaultDataDir(),
+            type: "string",
           }),
       (args) => {
-        startServer(args.port, args.hardware, args.device, args["enable-cors"], args["max-payload-size"]);
+        startServer(
+          args.port,
+          args.hardware,
+          args.device,
+          args["enable-cors"],
+          args["max-payload-size"],
+          args["data-dir"],
+        );
       },
     )
     .parse(argv);

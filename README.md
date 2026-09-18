@@ -173,6 +173,59 @@ echo dtoverly=dwc2,dr_mode=host | sudo tee -a /boot/config.txt
 ```
 
 
+#### Cameras & timelapses
+
+The **camera** tab (next to **plot** in the top left) gives you a live view of
+one or more cameras pointed at the plotter, records timelapses of your plots and
+renders them to MP4, much like the camera integration of a 3D printer.
+
+Cameras are read by the saxi server, so they can be anywhere the server can
+reach:
+
+| type | source | needs |
+|---|---|---|
+| USB / local camera | `/dev/video0` (Linux), a device index such as `0` (macOS), the device name (Windows) | `ffmpeg` |
+| Raspberry Pi camera module | (none) | `rpicam-vid` / `libcamera-vid` (Raspberry Pi OS) |
+| HTTP snapshot / MJPEG | a JPEG snapshot URL, or an MJPEG stream (IP cameras, phone camera apps, ESP32-CAM, mjpg-streamer, another Pi running [ustreamer](https://github.com/pikvm/ustreamer)…) | nothing |
+| RTSP stream | `rtsp://…` | `ffmpeg` |
+
+On a Raspberry Pi, install ffmpeg with `sudo apt install ffmpeg`. Without it,
+HTTP cameras still work but USB/RTSP cameras and video rendering are unavailable.
+
+A camera only streams while somebody is looking at it or a recording is in
+progress, and stops again after a few seconds of inactivity, so an idle camera
+does not cost any CPU. The live view polls one still per camera at a low rate
+(1 fps by default, adjustable in the tab) so it stays usable over Wi-Fi from a
+phone; `/cameras/<id>/stream.mjpeg` offers a continuous MJPEG stream for other
+tools. Set the camera's **capture fps** to how often it should sample frames:
+2–5 fps is plenty for timelapses and keeps a Pi cool.
+
+**Timelapses.** Enable **record every plot** and every plot is recorded from all
+enabled cameras at once, starting with a frame of the blank page and ending with
+the finished drawing. Frames are triggered by
+
+- **every pen lift** (with a minimum gap between frames), which gives the cleanest
+  frames because the pen is off the paper,
+- a **fixed interval**, or
+- a **target frame count**, where the interval is derived from the estimated plot
+  duration so that every plot yields a video of roughly the same length.
+
+You can also start a recording by hand and take snapshots whenever you like.
+When a recording ends it is rendered (if ffmpeg is available) to one MP4 per
+camera plus a side-by-side composite of all cameras; fps, quality, x264 preset,
+post-roll and composite are configurable and any recording can be re-rendered
+later with different settings. Rendering on a Raspberry Pi is slow, so pick a fast
+preset there or copy the frames elsewhere.
+
+Everything is stored under `~/.saxi` (override with `--data-dir` or
+`SAXI_DATA_DIR`): `cameras.json`, `timelapse.json` and one directory per
+recording in `timelapses/` containing `<camera>/frame-000001.jpg …`, the rendered
+videos in `renders/` and a `timelapse.json` describing the recording. Keep an eye
+on free disk space: a long plot with several full-resolution cameras adds up.
+
+The camera tab is only available when running the saxi server (not on the
+WebSerial-only web build), since the cameras are attached to the server.
+
 #### CORS
 
 If you want to connect to saxi from a web page that isn't served by saxi

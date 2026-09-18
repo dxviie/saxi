@@ -24,6 +24,7 @@ import useComponentSize from "./useComponentSize.js";
 import { formatDuration } from "./util.js";
 
 import "./style.css";
+import { CameraView, type View, ViewTabs } from "./camera-ui.js";
 import { type BaseDriver, type DeviceInfo, SaxiDriver, WebSerialDriver } from "./drivers.js";
 import type { Hardware } from "./ebb.js";
 import pathJoinRadiusIcon from "./icons/path-joining radius.svg";
@@ -1063,6 +1064,19 @@ function Root() {
   const { isPlanning, plan, setPlan } = usePlan(state.paths, state.planOptions);
   const [isLoadingFile, setIsLoadingFile] = useState(false);
 
+  // The camera tab only exists in server mode; the plot view stays mounted (hidden) while it is shown.
+  const [view, setView] = useState<View>(() => (!IS_WEB && window.location.hash === "#camera" ? "camera" : "plot"));
+  useEffect(() => {
+    if (IS_WEB) return;
+    const target = view === "camera" ? "#camera" : "";
+    if (window.location.hash !== target) {
+      history.replaceState(null, "", `${window.location.pathname}${window.location.search}${target}`);
+    }
+    const onHashChange = () => setView(window.location.hash === "#camera" ? "camera" : "plot");
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, [view]);
+
   useEffect(() => {
     window.localStorage.setItem("planOptions", JSON.stringify(state.planOptions));
   }, [state.planOptions]);
@@ -1160,14 +1174,24 @@ function Root() {
   const previewSize = useComponentSize(previewArea);
   const showDragTarget = !plan && !isLoadingFile && !isPlanning;
 
+  const title = (
+    <div className={"saxi-title red"}>
+      <span className="red reg">s</span>
+      <span className="teal">axi</span>
+    </div>
+  );
+  const tabs = IS_WEB ? null : <ViewTabs view={view} setView={setView} />;
+
   return (
     <DispatchContext.Provider value={dispatch}>
-      <div className={`root ${state.connected ? "connected" : "disconnected"}`}>
+      {view === "camera" && <CameraView tabs={tabs} title={title} />}
+      <div
+        className={`root ${state.connected ? "connected" : "disconnected"}`}
+        style={view === "camera" ? { display: "none" } : undefined}
+      >
         <div className="control-panel">
-          <div className={"saxi-title red"}>
-            <span className="red reg">s</span>
-            <span className="teal">axi</span>
-          </div>
+          {title}
+          {tabs}
           {!IS_WEB && (
             <div className={state.connected && state.deviceInfo?.path ? "info" : "info-disconnected"}>
               {state.connected

@@ -5,6 +5,7 @@
     "lineWidth": 120
   },
   "css": { "formatter": { "enabled": false } },
+  "javascript": { "jsxRuntime": "reactClassic" },
   "assist": { "actions": { "source": { "organizeImports": "on" } } },
   "linter": {
     "enabled": true,
