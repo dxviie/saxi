@@ -123,7 +123,8 @@ describe("camera & timelapse API", () => {
 
   beforeAll(async () => {
     images = await startImageServer();
-    dataDir = mkdtempSync(path.join(tmpdir(), "saxi-data-"));
+    // the default data dir is ~/.saxi: make sure files under a dot-directory are served
+    dataDir = mkdtempSync(path.join(tmpdir(), ".saxi-data-"));
     server = await startServer(0, "v3", "", false, "200mb", dataDir);
   });
 
@@ -262,6 +263,9 @@ describe("camera & timelapse API", () => {
     const session = (await request(server).get(`/timelapses/${id}`)).body as TimelapseSession;
     expect(session.renders).toHaveLength(3);
     expect(session.renders.every((r) => r.sizeBytes > 0)).toBe(true);
+    const download = await request(server).get(`/timelapses/${id}/renders/${session.renders[2].file}?download=1`);
+    expect(download.status).toBe(200);
+    expect(download.headers["content-disposition"]).toBe(`attachment; filename="${session.renders[2].file}"`);
     const video = await request(server)
       .get(`/timelapses/${id}/renders/${session.renders[2].file}`)
       .buffer()

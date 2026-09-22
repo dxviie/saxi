@@ -644,7 +644,7 @@ function TimelapseCard({
                   >
                     {playing === r.file ? "hide" : "play"}
                   </button>
-                  <a href={url} download={r.file}>
+                  <a href={`${url}?download=1`} download={r.file}>
                     {r.file}
                   </a>
                   <span className="timelapse-card__size">{formatBytes(r.sizeBytes)}</span>

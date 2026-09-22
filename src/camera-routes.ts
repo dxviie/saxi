@@ -27,6 +27,12 @@ import type { TimelapseStatusResponse } from "./camera-types.js";
 import { CameraConfigError, type CameraManager } from "./camera.js";
 import { TimelapseError, type TimelapseRecorder } from "./timelapse.js";
 
+/**
+ * Options for res.sendFile. The data directory defaults to ~/.saxi, and
+ * express refuses paths containing a dot-directory unless told otherwise.
+ */
+const SEND_FILE = { dotfiles: "allow" as const };
+
 function sendError(res: Response, e: unknown): void {
   if (e instanceof TimelapseError) {
     res.status(e.status).json({ error: e.message });
@@ -224,7 +230,10 @@ export function mountCameraRoutes(
         res.status(404).json({ error: "no such frame" });
         return;
       }
-      res.sendFile(file, { headers: { "Cache-Control": n === "last" ? "no-store" : "private, max-age=3600" } });
+      res.sendFile(file, {
+        ...SEND_FILE,
+        headers: { "Cache-Control": n === "last" ? "no-store" : "private, max-age=3600" },
+      });
     }),
   );
 
@@ -236,7 +245,9 @@ export function mountCameraRoutes(
         res.status(404).json({ error: "no such render" });
         return;
       }
-      res.sendFile(file, { headers: { "Content-Type": "video/mp4" } });
+      const headers: Record<string, string> = { "Content-Type": "video/mp4" };
+      if (req.query.download === "1") headers["Content-Disposition"] = `attachment; filename="${req.params.file}"`;
+      res.sendFile(file, { ...SEND_FILE, headers });
     }),
   );
 }
