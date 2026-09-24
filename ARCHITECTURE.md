@@ -16,6 +16,7 @@ There's a third operation mode, which is sending individual instructions to the 
   - `/cancel` To cancel the current plotting task.
   - `/pause` and `/resume`
   - It also keeps a WebSocket connection with the UI to track drawing progress, and receive some motion instructions.
+  - `/cameras`, `/timelapse` and `/timelapses` (see [`src/camera-routes.ts`](src/camera-routes.ts)) for the camera tab.
 - [`src/ui.tsx`](src/ui.tsx) The bulk of the React UI, handles the logic for rendering and interaction. It uses the `BaseDriver` interface to pass instructions to the Express Server. Important parts are:
   - `Root` contains all other components, the state of the UI, and handles most of the interaction events, including the loading of a new SVG.
   - The control panel has all the config settings, grouped in components: `PenHeight`, `MotorControl`, `PaperConfig`, etc.
@@ -23,6 +24,11 @@ There's a third operation mode, which is sending individual instructions to the 
 - [`src/drivers.ts`](src/drivers.ts) Interface between UI and Axi machine.  `SaxiDriver`, which uses an intermediate server and NodeSerialPort, and `WebSerialDriver`, which uses WebSerial, are both implementations of `BaseDriver`.
 - [`src/planning.ts`](src/planning.ts) Most of the logic of interpreting an SVG-like object and converting it into a `Plan` of machine instructions to execute. It defines attribute interfaces that are used both in the UI and the server.
 - [`src/massager.ts`](src/massager.ts) Some higher-level transformations that can be done like rotating.
+- [`src/camera.ts`](src/camera.ts) Server-side cameras: frame sources (ffmpeg for local devices and RTSP, `rpicam-vid` for the Pi camera, plain HTTP for snapshot/MJPEG URLs), an MJPEG frame parser, and `CameraManager` which persists the camera list to `<dataDir>/cameras.json`. A camera only streams while a preview client or a recording needs it.
+- [`src/timelapse.ts`](src/timelapse.ts) `TimelapseRecorder` captures synchronized frame sets from all enabled cameras into `<dataDir>/timelapses/<id>/<camera>/`, driven by hooks the server calls from its plot loop (`plotStarted`, `plotMotion` for pen-lift triggers, `plotEnded`) or by manual start/snap/stop, and renders MP4s with ffmpeg (one per camera plus a stacked composite).
+- [`src/camera-routes.ts`](src/camera-routes.ts) The HTTP API for the above.
+- [`src/camera-types.ts`](src/camera-types.ts) Types and defaults shared by the server and the UI.
+- [`src/camera-ui.tsx`](src/camera-ui.tsx) The React "camera" tab: live multi-camera grid (polled stills drawn on a canvas), camera and timelapse settings, recording controls and the timelapse library. It only talks to the REST API and does not touch the plotter state; `Root` in `ui.tsx` keeps the plot view mounted but hidden while the camera tab is shown.
 
 ## When dropping an SVG on the Drawing Area
 
