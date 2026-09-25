@@ -147,9 +147,25 @@ export class EBB {
       });
   }
 
-  public static async create(port: EBBPort, hardware: Hardware = "v3"): Promise<EBB> {
+  /**
+   * Set up the EBB on an open port and ask for its firmware version. Gives up after `timeoutMs`: a board that
+   * doesn't answer (another program talking to the port, a board in a bad state) would otherwise leave the
+   * connection waiting forever, and callers can retry instead.
+   */
+  public static async create(port: EBBPort, hardware: Hardware = "v3", timeoutMs = 5000): Promise<EBB> {
     const ebb = new EBB(port, hardware);
-    const versionString = await ebb.query("V");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const silence = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`no answer to the firmware version query (V) within ${timeoutMs / 1000} s`));
+      }, timeoutMs);
+    });
+    let versionString: string;
+    try {
+      versionString = await Promise.race([ebb.query("V"), silence]);
+    } finally {
+      clearTimeout(timer);
+    }
     console.log(`Firmware version: ${versionString}`);
     const versionWords = versionString.split(" ");
     const [major, minor, patch] = versionWords[versionWords.length - 1].split(".").map(Number);
