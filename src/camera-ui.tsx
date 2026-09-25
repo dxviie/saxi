@@ -275,8 +275,9 @@ function DeviceFields({ draft, set, cameraId }: { draft: CameraDraft; set: SetDr
   const [scanning, setScanning] = useState(true);
   const [scanError, setScanError] = useState<string | null>(null);
   const [manual, setManual] = useState(false);
-  // A new camera gets the first device no other camera uses, unless one was chosen in the meantime.
-  const autoPick = useRef(cameraId === null);
+  // The first scan fills in the device unless one was chosen in the meantime: the first device no other
+  // camera uses for a new camera, and the stable path of its device for one stored as /dev/videoN.
+  const suggest = useRef(true);
   const mounted = useRef(false);
 
   const scan = useCallback(async () => {
@@ -286,15 +287,21 @@ function DeviceFields({ draft, set, cameraId }: { draft: CameraDraft; set: SetDr
       if (!mounted.current) return;
       setFound(result);
       setScanError(null);
-      const free = result.devices.find((d) => d.usedBy.length === 0);
-      if (autoPick.current && free) set((d) => pickDevice(d, free, result.devices));
-      autoPick.current = false;
+      if (suggest.current) {
+        suggest.current = false;
+        if (cameraId === null) {
+          const free = result.devices.find((d) => d.usedBy.length === 0);
+          if (free) set((d) => pickDevice(d, free, result.devices));
+        } else {
+          set((d) => ({ source: result.devices.find((x) => x.paths.includes(d.source))?.source ?? d.source }));
+        }
+      }
     } catch (e) {
       if (mounted.current) setScanError((e as Error).message);
     } finally {
       if (mounted.current) setScanning(false);
     }
-  }, [set]);
+  }, [set, cameraId]);
 
   useEffect(() => {
     mounted.current = true;
@@ -333,7 +340,7 @@ function DeviceFields({ draft, set, cameraId }: { draft: CameraDraft; set: SetDr
           <select
             value={current?.source ?? OTHER_DEVICE}
             onChange={(e) => {
-              autoPick.current = false;
+              suggest.current = false;
               const device = devices.find((d) => d.source === e.target.value);
               setManual(!device);
               if (device) set((d) => pickDevice(d, device, devices));
@@ -356,7 +363,7 @@ function DeviceFields({ draft, set, cameraId }: { draft: CameraDraft; set: SetDr
             value={draft.source}
             placeholder={KIND_HELP.device.placeholder}
             onChange={(e) => {
-              autoPick.current = false;
+              suggest.current = false;
               setManual(true); // keep the text field while typing, even if the path matches a listed camera
               set({ source: e.target.value });
             }}

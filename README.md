@@ -198,7 +198,8 @@ work out which `/dev/videoN` to use (most webcams create two, and only one of
 them delivers video). A camera you pick is stored by its `/dev/v4l/by-id/…`
 link, or by its `/dev/v4l/by-path/…` USB port link for identical cameras
 without a serial number, so it keeps working when the numbers change after
-replugging or a reboot. `mjpeg` is preselected when a camera offers it:
+replugging or a reboot (a camera set up with `/dev/videoN` switches over when
+you edit and save it). `mjpeg` is preselected when a camera offers it:
 uncompressed video needs so much USB bandwidth that several uncompressed
 cameras often cannot run at once. Pick “other…” to enter a device path yourself.
 
