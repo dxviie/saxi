@@ -7,6 +7,7 @@
 
 import http from "node:http";
 import type { AddressInfo } from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { autoDetect } from "@serialport/bindings-cpp";
@@ -17,13 +18,19 @@ import express from "express";
 import type WebSocket from "ws";
 import { WebSocketServer } from "ws";
 import { createMockSerialPort } from "./__tests__/mocks/serialport.js";
+import { mountCameraRoutes } from "./camera-routes.js";
+import { CameraManager } from "./camera.js";
 import { EBB, type EBBPort, type Hardware } from "./ebb.js";
 import { type Motion, PenMotion, Plan } from "./planning.js";
 import { SerialPortSerialPort } from "./serialport-serialport.js";
 import * as _self from "./server.js"; // use self-import for test mocking
+import { TimelapseRecorder } from "./timelapse.js";
 import { formatDuration } from "./util.js";
 
 type Com = string;
+
+/** Before a plot, the pen moves to its starting height and the EBB waits this long before the first motion. */
+const PRE_PLOT_PEN_DELAY_MS = 1000;
 
 /**
  * Shorthand for getting the device info, either EBB or com port.
@@ -37,6 +44,11 @@ const getDeviceInfo = (ebb: EBB | null, _com: Com) => {
   return { path: portPath, hardware: ebb?.hardware };
 };
 
+/** Where saxi keeps camera settings and timelapse recordings unless told otherwise. */
+export function defaultDataDir(): string {
+  return process.env.SAXI_DATA_DIR || path.join(os.homedir(), ".saxi");
+}
+
 /**
  * Start the express server.
  * @param port
@@ -44,6 +56,7 @@ const getDeviceInfo = (ebb: EBB | null, _com: Com) => {
  * @param com
  * @param enableCors
  * @param maxPayloadSize
+ * @param dataDir directory for camera settings and timelapse recordings
  * @returns
  */
 export async function startServer(
@@ -52,7 +65,7 @@ export async function startServer(
   com: Com = "",
   enableCors = false,
   maxPayloadSize = "200mb",
-  svgIoApiKey = "",
+  dataDir: string = defaultDataDir(),
 ) {
   const app = express();
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -61,6 +74,9 @@ export async function startServer(
   if (enableCors) {
     app.use(cors());
   }
+  // Cameras and timelapse recording (see camera.ts / timelapse.ts)
+  const cameras = new CameraManager(dataDir);
+  const timelapse = new TimelapseRecorder(cameras, dataDir);
   // Web and Socket server
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server });
@@ -73,6 +89,8 @@ export async function startServer(
   let currentPlan: Plan | null = null;
   let plotting = false;
   let controller: AbortController | null = null;
+
+  mountCameraRoutes(app, cameras, timelapse, () => plotting);
 
   wss.on("connection", (ws) => {
     clients.push(ws);
@@ -107,13 +125,11 @@ export async function startServer(
     // send starting params to clients
     ws.send(JSON.stringify({ c: "dev", p: getDeviceInfo(ebb, com) }));
 
-    ws.send(JSON.stringify({ c: "svgio-enabled", p: svgIoApiKey !== "" }));
-
     ws.send(JSON.stringify({ c: "pause", p: { paused: !!unpaused } }));
-    if (motionIdx != null) {
+    if (motionIdx !== null) {
       ws.send(JSON.stringify({ c: "progress", p: { motionIdx } }));
     }
-    if (currentPlan != null) {
+    if (currentPlan !== null) {
       ws.send(JSON.stringify({ c: "plan", p: { motions: currentPlan.toTransferable() } }));
     }
 
@@ -138,7 +154,7 @@ export async function startServer(
       const plan = Plan.deserialize(req.body);
       currentPlan = plan;
       console.log(`Received plan of estimated duration ${formatDuration(plan.duration())}`);
-      console.log(ebb != null ? "Beginning plot..." : "Simulating plot...");
+      console.log(ebb !== null ? "Beginning plot..." : "Simulating plot...");
       res.status(200).end();
 
       const begin = Date.now();
@@ -157,7 +173,7 @@ export async function startServer(
         console.log("Wake lock not available on this platform. Ensure your machine does not sleep during plotting");
       }
       try {
-        const plotEbb = ebb ?? new EBB(createMockSerialPort() as unknown as EBBPort);
+        const plotEbb = ebb ?? (await EBB.create(createMockSerialPort() as unknown as EBBPort));
         await doPlot(createPlotter(plotEbb), plan, signal);
         const end = Date.now();
         console.log(`Plot took ${formatDuration((end - begin) / 1000)}`);
@@ -208,32 +224,6 @@ export async function startServer(
     res.status(200).end();
   });
 
-  app.post("/generate", async (req: Request, res: Response) => {
-    if (plotting) {
-      console.log("Received generate request, but a plot is already in progress!");
-      res.status(400).end("Plot in progress");
-      return;
-    }
-    const { prompt, vecType } = req.body;
-    try {
-      // call the api and return the svg
-      const apiResp = await fetch("https://api.svg.io/v1/generate-image", {
-        method: "post",
-        headers: {
-          Authorization: `Bearer ${svgIoApiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ prompt, style: vecType, negativePrompt: "" }),
-      });
-      // forward the api response
-      const data = await apiResp.json();
-      res.status(apiResp.status).send(data);
-    } catch (err) {
-      console.error(err);
-      res.status(500).end();
-    }
-  });
-
   function broadcast(msg: Record<string, unknown>) {
     for (const client of clients) {
       try {
@@ -256,7 +246,7 @@ export async function startServer(
       async prePlot(initialPenHeight: number): Promise<void> {
         await ebb.configureFifoDepth();
         await ebb.enableMotors(1); // 16x microstepping, matches defaults from Axidraw
-        await ebb.setPenHeight(initialPenHeight, 1000, 1000);
+        await ebb.setPenHeight(initialPenHeight, 1000, PRE_PLOT_PEN_DELAY_MS);
       },
       async executeMotion(motion: Motion, _progress: [number, number]): Promise<void> {
         await ebb.executeMotion(motion);
@@ -282,12 +272,15 @@ export async function startServer(
     motionIdx = 0;
 
     const firstPenMotion = plan.motions.find((x) => x instanceof PenMotion) as PenMotion;
+    await timelapse.plotStarted(plan.duration()); // captures the blank page before anything moves
     await plotter.prePlot(firstPenMotion.initialPos);
+    timelapse.plotterBusy(PRE_PLOT_PEN_DELAY_MS); // tells the timelapse when the first motion really starts
 
     let penIsUp = true;
     try {
       for (const motion of plan.motions) {
         broadcast({ c: "progress", p: { motionIdx } });
+        timelapse.plotMotion(motion);
 
         await Promise.race([plotter.executeMotion(motion, [motionIdx, plan.motions.length]), abortPromise]);
 
@@ -315,6 +308,7 @@ export async function startServer(
       motionIdx = null;
       currentPlan = null;
       await plotter.postPlot();
+      await timelapse.plotEnded(signal.aborted); // final frame of the finished drawing
     }
   }
 
@@ -324,6 +318,11 @@ export async function startServer(
       signal.addEventListener("abort", () => reject(new Error("Aborted")), { once: true });
     });
   }
+
+  server.on("close", () => {
+    timelapse.close();
+    cameras.close();
+  });
 
   return new Promise<http.Server>((resolve) => {
     server.listen(port, () => {
@@ -387,13 +386,19 @@ async function* ebbs(path?: string, hardware: Hardware = "v3") {
       const com: Com = path || (await _self.waitForEbb()); // use self-import for test mocking
       console.log(`Found EBB at ${com}`);
       const port = await tryOpen(com);
-      const closed = new Promise((resolve) => {
-        port.addEventListener("disconnect", resolve, { once: true });
-      });
-      yield new EBB(port, hardware);
-      await closed;
-      yield null;
-      console.error("Lost connection to EBB, reconnecting...");
+      try {
+        const closed = new Promise((resolve) => {
+          port.addEventListener("disconnect", resolve, { once: true });
+        });
+        yield await EBB.create(port, hardware);
+        await closed;
+        yield null;
+        console.error("Lost connection to EBB, reconnecting...");
+      } finally {
+        if (port.connected) {
+          await port.close();
+        }
+      }
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e));
       console.error(`Error connecting to EBB: ${err.message}`);
@@ -408,5 +413,5 @@ export async function connectEBB(hardware: Hardware, device?: string): Promise<E
   if (!dev) return null;
 
   const port = await tryOpen(dev);
-  return new EBB(port, hardware);
+  return await EBB.create(port, hardware);
 }

@@ -59,16 +59,20 @@ export type Hardware = "v3" | "brushless" | "nextdraw-2234";
  * plus a close hook. A WebSerial/Node `SerialPort` satisfies this structurally,
  * but so does any pair of intermediate streams (such as to/from a worker)
  */
+
+const PENDING = Symbol("PENDING");
+
 export interface EBBPort {
   readable: ReadableStream<Uint8Array>;
   writable: WritableStream<Uint8Array>;
   close(): Promise<void>;
 }
 
-interface PendingCommand<T = unknown> {
-  iterator: Iterator<unknown, T, string>;
-  resolve: (value: T) => void;
-  reject: (reason: Error) => void;
+interface PendingCommand {
+  handle: (line: string) => unknown | typeof PENDING;
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  cancelled: boolean;
 }
 
 export class EBB {
@@ -82,9 +86,9 @@ export class EBB {
   /** Accumulated XY error, used to correct for movements with sub-step resolution */
   private error: Vec2 = { x: 0, y: 0 };
 
-  private cachedFirmwareVersion: [number, number, number] | undefined = undefined;
+  public firmwareVersion!: [number, number, number];
 
-  public constructor(port: EBBPort, hardware: Hardware = "v3") {
+  private constructor(port: EBBPort, hardware: Hardware = "v3") {
     this.hardware = hardware;
     this.port = port;
     if (!port.readable || !port.writable) {
@@ -106,9 +110,16 @@ export class EBB {
 
             for (const part of parts) {
               if (part.trim() === "") continue; // empty line
+
+              if (part === "!8 Err: Unknown command 'OK:4F4B'") continue; // initial startup
+
               const cmd = this.commandQueue[0];
               if (!cmd) {
                 console.log(`unexpected data: ${part}`);
+                continue;
+              }
+              if (cmd.cancelled) {
+                this.commandQueue.shift(); // silently drain an orphaned response
                 continue;
               }
               if (part[0] === "!") {
@@ -117,9 +128,9 @@ export class EBB {
                 continue;
               }
               try {
-                const d = cmd.iterator.next(part);
-                if (d.done) {
-                  this.commandQueue.shift()?.resolve(d.value);
+                const result = cmd.handle(part);
+                if (result !== PENDING) {
+                  this.commandQueue.shift()?.resolve(result);
                 }
               } catch (e) {
                 this.commandQueue.shift()?.reject(e as Error);
@@ -134,6 +145,32 @@ export class EBB {
           throw error;
         }
       });
+  }
+
+  /**
+   * Set up the EBB on an open port and ask for its firmware version. Gives up after `timeoutMs`: a board that
+   * doesn't answer (another program talking to the port, a board in a bad state) would otherwise leave the
+   * connection waiting forever, and callers can retry instead.
+   */
+  public static async create(port: EBBPort, hardware: Hardware = "v3", timeoutMs = 5000): Promise<EBB> {
+    const ebb = new EBB(port, hardware);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const silence = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`no answer to the firmware version query (V) within ${timeoutMs / 1000} s`));
+      }, timeoutMs);
+    });
+    let versionString: string;
+    try {
+      versionString = await Promise.race([ebb.query("V"), silence]);
+    } finally {
+      clearTimeout(timer);
+    }
+    console.log(`Firmware version: ${versionString}`);
+    const versionWords = versionString.split(" ");
+    const [major, minor, patch] = versionWords[versionWords.length - 1].split(".").map(Number);
+    ebb.firmwareVersion = [major, minor, patch];
+    return ebb;
   }
 
   private get stepMultiplier() {
@@ -161,17 +198,14 @@ export class EBB {
       console.log(`writing: ${str}`);
     }
     const encoder = new TextEncoder();
-    return this.writer.write(encoder.encode(str));
+    // biome-ignore lint/style/useTemplate: clarity
+    return this.writer.write(encoder.encode(str + "\r"));
   }
 
   /** Send a raw command to the EBB and expect a single line in return, without an "OK" line to terminate. */
   public async query(cmd: EBBQuery): Promise<string> {
     try {
-      return await this.run(function* (this: EBB): Iterator<unknown, string, string> {
-        this.write(`${cmd}\r`);
-        const result = yield;
-        return result;
-      });
+      return await this.run(cmd, (line) => line);
     } catch (err) {
       throw new Error(`Error in response to query '${cmd}': ${(err as Error).message}`);
     }
@@ -180,15 +214,11 @@ export class EBB {
   /** Send a raw command to the EBB and expect multiple lines in return, with an "OK" line to terminate. */
   public async queryM(cmd: EBBQueryM): Promise<string[]> {
     try {
-      return await this.run(function* (this: EBB): Iterator<unknown, string[], string> {
-        this.write(`${cmd}\r`);
-        const result: string[] = [];
-        while (true) {
-          const line = yield;
-          if (line === "OK") { break; } // biome-ignore format: compactness
-          result.push(line);
-        }
-        return result;
+      const result: string[] = [];
+      return await this.run(cmd, (line) => {
+        if (line === "OK") return result;
+        result.push(line);
+        return PENDING;
       });
     } catch (err) {
       throw new Error(`Error in response to queryM '${cmd}': ${(err as Error).message}`);
@@ -198,12 +228,16 @@ export class EBB {
   /** Send a raw command to the EBB and expect a single "OK" line in return. */
   public async command(cmd: EBBCommand): Promise<void> {
     try {
-      return await this.run(function* (): Iterator<void, void, string> {
-        this.write(`${cmd}\r`);
-        const ok = yield;
-        if (ok !== "OK") {
-          throw new Error(`Expected OK, got ${ok}`);
+      return await this.run(cmd, (line) => {
+        if (line === "OK") return;
+        if (line === cmd.slice(0, 2)) {
+          throw new Error(
+            "Your EBB appears to be using 'future mode', which saxi does not currently support.\n" +
+              "Until support is added, please switch to 'legacy mode' by sending CU,10,0.\n" +
+              "See https://evil-mad.github.io/EggBot/ebb.html#CU",
+          );
         }
+        throw new Error(`Expected OK, got ${line}`);
       });
     } catch (err) {
       throw new Error(`Error in response to command '${cmd}': ${(err as Error).message}`);
@@ -236,7 +270,7 @@ export class EBB {
   public async configureFifoDepth(): Promise<void> {
     try {
       const requested = Math.floor(Number(process.env.SAXI_FIFO_DEPTH || 0));
-      if ((await this.firmwareVersionCompare(3, 0, 0)) < 0) {
+      if (this.firmwareVersionCompare(3, 0, 0) < 0) {
         if (requested > 1) {
           console.log("[saxi] SAXI_FIFO_DEPTH ignored: firmware < 3.0.0 has a fixed 1-deep FIFO");
         }
@@ -250,12 +284,16 @@ export class EBB {
     }
   }
 
-  /** Reject all pending commands immediately **/
+  /** Cancel all pending commands. Commands already sent to the board are
+   *  marked and left as sentinels so their in-flight responses are received
+   *  by the reader (which will discard them) */
   public cancel(): void {
-    while (this.commandQueue.length > 0) {
-      this.commandQueue.shift()?.reject(new Error("Cancelled"));
+    for (const cmd of this.commandQueue) {
+      cmd.cancelled = true;
+      cmd.reject(new Error("Cancelled"));
     }
   }
+
   public async enableMotors(microsteppingMode: RunningMicrostepMode): Promise<void> {
     this.microsteppingMode = microsteppingMode;
     await this.command(`EM,${microsteppingMode},${microsteppingMode}`);
@@ -282,7 +320,7 @@ export class EBB {
    */
   public async setServoPowerTimeout(timeout: number, power?: boolean) {
     const timeoutMs = (timeout * 1000) | 0;
-    if (power != null) {
+    if (power !== undefined) {
       const powerState: PowerState = power ? 1 : 0;
       await this.command(`SR,${timeoutMs},${powerState}`);
     } else {
@@ -494,35 +532,13 @@ export class EBB {
   }
 
   /**
-   * Query the firmware version running on the EBB.
-   *
-   * @return The version string, e.g. "EBBv13_and_above EB Firmware Version 2.5.3"
-   */
-  public async firmwareVersion(): Promise<string> {
-    return await this.query("V");
-  }
-
-  /**
-   * @return The firmware version as a parsed version triple, e.g. [2, 5, 3]
-   */
-  public async firmwareVersionNumber(): Promise<[number, number, number]> {
-    if (this.cachedFirmwareVersion === undefined) {
-      const versionString = await this.firmwareVersion();
-      const versionWords = versionString.split(" ");
-      const [major, minor, patch] = versionWords[versionWords.length - 1].split(".").map(Number);
-      this.cachedFirmwareVersion = [major, minor, patch];
-    }
-    return this.cachedFirmwareVersion;
-  }
-
-  /**
    * Compare the firmware version of the EBB with the given version.
    *
    * @return -1 if the firmware is older than the given version, 0 if it's
    * identical, and 1 if it's newer.
    */
-  public async firmwareVersionCompare(major: number, minor: number, patch: number): Promise<number> {
-    const [fwMajor, fwMinor, fwPatch] = await this.firmwareVersionNumber();
+  public firmwareVersionCompare(major: number, minor: number, patch: number): number {
+    const [fwMajor, fwMinor, fwPatch] = this.firmwareVersion;
     if (fwMajor < major) return -1;
     if (fwMajor > major) return 1;
     if (fwMinor < minor) return -1;
@@ -544,15 +560,15 @@ export class EBB {
   /**
    * @return true iff the EBB firmware supports the LM command.
    */
-  public async supportsLM(): Promise<boolean> {
-    return (await this.firmwareVersionCompare(2, 5, 3)) >= 0;
+  public supportsLM(): boolean {
+    return this.firmwareVersionCompare(2, 5, 3) >= 0;
   }
 
   /**
    * @return true iff the EBB firmware supports the SR command.
    */
-  public async supportsSR(): Promise<boolean> {
-    return (await this.firmwareVersionCompare(2, 6, 0)) >= 0;
+  public supportsSR(): boolean {
+    return this.firmwareVersionCompare(2, 6, 0) >= 0;
   }
 
   /**
@@ -574,14 +590,16 @@ export class EBB {
     return [initialRate, deltaR];
   }
 
-  private run<T>(g: (this: EBB) => Iterator<unknown, T, string>): Promise<T> {
-    const iterator = g.call(this);
-    const d = iterator.next();
-    if (d.done) {
-      return Promise.resolve(d.value);
-    }
+  private run<T>(cmd: string, handle: (line: string) => T | typeof PENDING): Promise<T> {
     return new Promise((resolve, reject) => {
-      this.commandQueue.push({ iterator, resolve, reject } as PendingCommand);
+      this.commandQueue.push({
+        handle,
+        resolve: (value) => resolve(value as T),
+        reject,
+        cancelled: false,
+      });
+
+      void this.write(cmd);
     });
   }
 }

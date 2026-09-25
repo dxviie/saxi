@@ -1,10 +1,11 @@
 {
-  "$schema": "https://biomejs.dev/schemas/2.5.0/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.5.13/schema.json",
   "formatter": {
     "indentStyle": "space",
     "lineWidth": 120
   },
   "css": { "formatter": { "enabled": false } },
+  "javascript": { "jsxRuntime": "reactClassic" },
   "assist": { "actions": { "source": { "organizeImports": "on" } } },
   "linter": {
     "enabled": true,
@@ -28,7 +29,12 @@
         "noInferrableTypes": "error",
         "noUselessElse": "error"
       },
-      "security": { "noBlankTarget": "error" }
+      "security": { "noBlankTarget": "error" },
+      "suspicious": { "noEqualsToNull": "warn", "noUnknownAttribute": "error" },
+      "nursery": {
+        "noUndeclaredClasses": "warn",
+        "noRestrictedDependencies": "warn"
+      }
     }
   },
   "overrides": [

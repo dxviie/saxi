@@ -24,6 +24,7 @@ import useComponentSize from "./useComponentSize.js";
 import { formatDuration } from "./util.js";
 
 import "./style.css";
+import { CameraView, type View, ViewTabs } from "./camera-ui.js";
 import { type BaseDriver, type DeviceInfo, SaxiDriver, WebSerialDriver } from "./drivers.js";
 import type { Hardware } from "./ebb.js";
 import pathJoinRadiusIcon from "./icons/path-joining radius.svg";
@@ -33,13 +34,6 @@ import rotateDrawingIcon from "./icons/rotate-drawing.svg";
 const defaultVisualizationOptions = {
   penStrokeWidth: 0.5,
   colorPathsByStrokeOrder: false,
-};
-
-const defaultSvgIoOptions = {
-  enabled: false,
-  prompt: "",
-  status: "",
-  vecType: "FLAT_VECTOR",
 };
 
 const initialState = {
@@ -52,7 +46,6 @@ const initialState = {
   // UI state
   planOptions: defaultPlanOptions,
   visualizationOptions: defaultVisualizationOptions,
-  svgIoOptions: defaultSvgIoOptions,
 
   // Options used to produce the current value of |plan|.
   plannedOptions: null as PlanOptions | null,
@@ -77,7 +70,6 @@ type State = typeof initialState;
 type Action =
   | { type: "SET_PLAN_OPTION"; value: Partial<State["planOptions"]> }
   | { type: "SET_VISUALIZATION_OPTION"; value: Partial<State["visualizationOptions"]> }
-  | { type: "SET_SVGIO_OPTION"; value: Partial<State["svgIoOptions"]> }
   | { type: "SET_DEVICE_INFO"; value: State["deviceInfo"] }
   | { type: "SET_PAUSED"; value: boolean }
   | { type: "SET_PROGRESS"; motionIdx: number | null }
@@ -108,8 +100,6 @@ function reducer(state: State, action: Action): State {
       return { ...state, planOptions: { ...state.planOptions, ...action.value } };
     case "SET_VISUALIZATION_OPTION":
       return { ...state, visualizationOptions: { ...state.visualizationOptions, ...action.value } };
-    case "SET_SVGIO_OPTION":
-      return { ...state, svgIoOptions: { ...state.svgIoOptions, ...action.value } };
     case "SET_DEVICE_INFO":
       return { ...state, deviceInfo: action.value };
     case "SET_PAUSED":
@@ -168,7 +158,7 @@ const usePlan = (paths: Path[] | null, planOptions: PlanOptions) => {
     if (!paths) {
       return () => {};
     }
-    if (lastPlan.current != null && lastPaths.current === paths) {
+    if (lastPlan.current !== null && lastPaths.current === paths) {
       const rejiggered = attemptRejigger(lastPlanOptions.current ?? defaultPlanOptions, planOptions, lastPlan.current);
       if (rejiggered) {
         setPlan(rejiggered);
@@ -383,81 +373,6 @@ function OriginOptions({ state }: { state: State }) {
         />
       </label>
     </div>
-  );
-}
-/**
- * Options to get an AI-Generated SVG image.
- * Use svg.io API: https://api.svg.io/v1/docs
- */
-function SvgIoOptions({ state }: { state: State }) {
-  const { prompt, vecType, status } = state.svgIoOptions;
-  const dispatch = useContext(DispatchContext);
-  // call server
-  const generateImage = async () => {
-    dispatch({ type: "SET_SVGIO_OPTION", value: { status: "Generating ..." } });
-    try {
-      const resp = await fetch("/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: new Blob([JSON.stringify({ prompt, vecType })], { type: "application/json" }),
-      });
-      const data = await resp.json();
-      if (resp.ok) {
-        dispatch({ type: "SET_SVGIO_OPTION", value: { status: "Loading ..." } });
-        // retrieve image
-        const imgUrl = data.data[0].svgUrl;
-        const imgResp = await fetch(imgUrl);
-        const imgData = await imgResp.text();
-        // set image contents
-        dispatch(setPaths(readSvg(imgData)));
-      } else {
-        alert(`Error generating image: ${data.message ? data.message : resp.statusText}`);
-      }
-    } catch (error) {
-      console.error(error);
-      alert(`Error generating image ${error}`);
-    } finally {
-      dispatch({ type: "SET_SVGIO_OPTION", value: { status: "" } });
-    }
-  };
-  return (
-    <>
-      <div>
-        <label>
-          Type
-          <select
-            value={vecType}
-            onChange={(e) => dispatch({ type: "SET_SVGIO_OPTION", value: { vecType: e.target.value } })}
-          >
-            <option value={"FLAT_VECTOR"}>Flat</option>
-            <option value={"FLAT_VECTOR_OUTLINE"}>Outline</option>
-            <option value={"FLAT_VECTOR_SILHOUETTE"}>Silhouette</option>
-            <option value={"FLAT_VECTOR_ONE_LINE_ART"}>One Line Art</option>
-            <option value={"FLAT_VECTOR_LINE_ART"}>Line Art</option>
-          </select>
-        </label>
-        <label title="prompt">
-          Prompt
-          <textarea
-            value={prompt}
-            onChange={(e) => dispatch({ type: "SET_SVGIO_OPTION", value: { prompt: e.target.value } })}
-          />
-        </label>
-      </div>
-      {prompt !== "" ? (
-        <div>
-          {status ? (
-            <span>{status}</span>
-          ) : (
-            <button type="button" onClick={generateImage}>
-              Generate!
-            </button>
-          )}
-        </div>
-      ) : (
-        ""
-      )}
-    </>
   );
 }
 
@@ -705,7 +620,7 @@ function PlanPreview({
   useLayoutEffect(() => {
     let rafHandle: number;
     let cancelled = false;
-    if (state.progress != null) {
+    if (state.progress !== null) {
       const startingTime = Date.now();
       const updateProgress = () => {
         if (cancelled) {
@@ -718,7 +633,7 @@ function PlanPreview({
     }
     return () => {
       cancelled = true;
-      if (rafHandle != null) {
+      if (rafHandle !== null) {
         cancelAnimationFrame(rafHandle);
       }
       setMicroprogress(0);
@@ -726,7 +641,7 @@ function PlanPreview({
   }, [state.progress]);
 
   let progressIndicator = <></>;
-  if (state.progress != null && plan != null) {
+  if (state.progress !== null && plan !== null) {
     const motion = plan.motion(state.progress);
     const pos =
       motion instanceof XYMotion
@@ -820,7 +735,7 @@ function LayerSelector({ state }: { state: State }) {
           value={[...selectedLayers]}
           onChange={layersChanged}
           size={3}
-          disabled={state.progress != null}
+          disabled={state.progress !== null}
         >
           {layers.map((layer) => (
             <option key={layer}>{layer}</option>
@@ -864,27 +779,27 @@ function PlotButtons({
       ) : (
         <button
           type="button"
-          className={`plot-button ${state.progress != null ? "plot-button--plotting" : ""}`}
-          disabled={plan == null || state.progress != null}
+          className={`plot-button ${state.progress !== null ? "plot-button--plotting" : ""}`}
+          disabled={plan === null || state.progress !== null}
           onClick={() => plan && plot(plan)}
         >
-          {plan && state.progress != null ? "Plotting..." : "Plot"}
+          {plan && state.progress !== null ? "Plotting..." : "Plot"}
         </button>
       )}
       <div className={"button-row"}>
         <button
           type="button"
-          className={`cancel-button ${state.progress != null ? "cancel-button--active" : ""}`}
+          className={`cancel-button ${state.progress !== null ? "cancel-button--active" : ""}`}
           onClick={state.paused ? resume : pause}
-          disabled={plan == null || state.progress == null}
+          disabled={plan === null || state.progress === null}
         >
           {state.paused ? "Resume" : "Pause"}
         </button>
         <button
           type="button"
-          className={`cancel-button ${state.progress != null ? "cancel-button--active" : ""}`}
+          className={`cancel-button ${state.progress !== null ? "cancel-button--active" : ""}`}
           onClick={cancel}
-          disabled={plan == null || state.progress == null}
+          disabled={plan === null || state.progress === null}
         >
           Cancel
         </button>
@@ -1149,13 +1064,26 @@ function Root() {
   const { isPlanning, plan, setPlan } = usePlan(state.paths, state.planOptions);
   const [isLoadingFile, setIsLoadingFile] = useState(false);
 
+  // The camera tab only exists in server mode; the plot view stays mounted (hidden) while it is shown.
+  const [view, setView] = useState<View>(() => (!IS_WEB && window.location.hash === "#camera" ? "camera" : "plot"));
+  useEffect(() => {
+    if (IS_WEB) return;
+    const target = view === "camera" ? "#camera" : "";
+    if (window.location.hash !== target) {
+      history.replaceState(null, "", `${window.location.pathname}${window.location.search}${target}`);
+    }
+    const onHashChange = () => setView(window.location.hash === "#camera" ? "camera" : "plot");
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, [view]);
+
   useEffect(() => {
     window.localStorage.setItem("planOptions", JSON.stringify(state.planOptions));
   }, [state.planOptions]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies(setPlan): React setters are stable
   useEffect(() => {
-    if (driver == null) return;
+    if (driver === null) return;
     driver.onprogress = (motionIdx: number) => {
       dispatch({ type: "SET_PROGRESS", motionIdx });
     };
@@ -1172,11 +1100,6 @@ function Root() {
     driver.onplan = (plan: Plan) => {
       setPlan(plan);
     };
-    if (driver instanceof SaxiDriver) {
-      driver.svgioEnabled = (enabled: boolean) => {
-        dispatch({ type: "SET_SVGIO_OPTION", value: { enabled } });
-      };
-    }
   }, [driver, state.planOptions]);
 
   useEffect(() => {
@@ -1251,14 +1174,24 @@ function Root() {
   const previewSize = useComponentSize(previewArea);
   const showDragTarget = !plan && !isLoadingFile && !isPlanning;
 
+  const title = (
+    <div className={"saxi-title red"}>
+      <span className="red reg">s</span>
+      <span className="teal">axi</span>
+    </div>
+  );
+  const tabs = IS_WEB ? null : <ViewTabs view={view} setView={setView} />;
+
   return (
     <DispatchContext.Provider value={dispatch}>
-      <div className={`root ${state.connected ? "connected" : "disconnected"}`}>
+      {view === "camera" && <CameraView tabs={tabs} title={title} />}
+      <div
+        className={`root ${state.connected ? "connected" : "disconnected"}`}
+        style={view === "camera" ? { display: "none" } : undefined}
+      >
         <div className="control-panel">
-          <div className={"saxi-title red"}>
-            <span className="red reg">s</span>
-            <span className="teal">axi</span>
-          </div>
+          {title}
+          {tabs}
           {!IS_WEB && (
             <div className={state.connected && state.deviceInfo?.path ? "info" : "info-disconnected"}>
               {state.connected
@@ -1295,14 +1228,6 @@ function Root() {
               <VisualizationOptions state={state} />
             </div>
           </details>
-          {state.svgIoOptions.enabled && (
-            <details>
-              <summary className="section-header">AI</summary>
-              <div className="section-body">
-                <SvgIoOptions state={state} />
-              </div>
-            </details>
-          )}
           <div className="spacer" />
           <div className="control-panel-bottom">
             <div className="section-header">plot</div>

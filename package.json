@@ -30,7 +30,6 @@
     "build:ui": "node --experimental-modules build.mjs",
     "prepare": "node -e \"require('fs').rmSync('./dist', { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 10 : 0 })\" && npm run build",
     "start": "npm run build && node cli.mjs",
-    "start-svgio": "npm run build && node cli.mjs --svgio-api-key YOUR_API_KEY",
     "start-webserial": "cross-env IS_WEB=1 SAXI_HOT_RELOAD=1 npm run build:ui",
     "deploy": "node -e \"require('fs').rmSync('./dist/ui', { recursive: true, force: true, maxRetries: process.platform === 'win32' ? 10 : 0 })\" && cross-env IS_WEB=1 npm run build:ui && gh-pages --dist dist/ui",
     "test": "vitest run"
@@ -38,7 +37,7 @@
   "author": "Jeremy Rose <nornagon@nornagon.net>",
   "license": "AGPL-3.0-only",
   "devDependencies": {
-    "@biomejs/biome": "2.5.0",
+    "@biomejs/biome": "2.5.13",
     "@craftamap/esbuild-plugin-html": "^0.9.0",
     "@serialport/bindings-cpp": "^13.0.0",
     "@types/cors": "^2.8.4",
@@ -57,7 +56,7 @@
     "semver": "^7.5.2",
     "supertest": "^7.0.0",
     "typescript": "^7.0.0",
-    "vitest": "^4.0.0"
+    "vitest": "^5.0.0"
   },
   "dependencies": {
     "color-interpolate": "^2.0.0",
@@ -69,7 +68,7 @@
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "serialport": "^13.0.0",
-    "svgdom": "0.1.23",
+    "svgdom": "0.1.29",
     "ws": "^8.0.0",
     "yargs": "^18.0.0"
   },

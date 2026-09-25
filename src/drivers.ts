@@ -1,10 +1,9 @@
-import { EBB, type Hardware } from "./ebb.js";
+import { EBB, type EBBPort, type Hardware } from "./ebb.js";
 import { Device, PenMotion, Plan } from "./planning.js";
 
 export interface DeviceInfo {
   path: string;
   hardware: Hardware;
-  svgIoEnabled: boolean;
 }
 
 /**
@@ -53,8 +52,11 @@ export class WebSerialDriver extends BaseDriver {
     // and https://pyserial.readthedocs.io/en/latest/pyserial_api.html#serial.Serial.__init__
     // (pyserial defaults to 9600)
     await port.open({ baudRate: 9600 });
+    if (!port.readable || !port.writable) {
+      throw new Error("Serial port failed to open: readable/writable streams unavailable");
+    }
     const { usbVendorId, usbProductId } = port.getInfo();
-    const ebb = new EBB(port, hardware);
+    const ebb = await EBB.create(port as SerialPort & EBBPort, hardware);
 
     const vendorId = usbVendorId?.toString(16).padStart(4, "0");
     const productId = usbProductId?.toString(16).padStart(4, "0");
@@ -156,7 +158,7 @@ export class WebSerialDriver extends BaseDriver {
   }
 
   public async setPenHeight(height: number, rate: number): Promise<void> {
-    if (await this.ebb.supportsSR()) {
+    if (this.ebb.supportsSR()) {
       await this.ebb.setServoPowerTimeout(10000, true);
     }
     await this.ebb.setPenHeight(height, rate);
@@ -171,7 +173,6 @@ export class WebSerialDriver extends BaseDriver {
     this.ondevinfo({
       path: this._name,
       hardware: hardware,
-      svgIoEnabled: false, // WebSerial doesn't support SVG I/O
     });
   }
 }
@@ -182,9 +183,8 @@ export class WebSerialDriver extends BaseDriver {
  * configuration (IS_WEB is unset).
  */
 export class SaxiDriver extends BaseDriver {
-  private socket: WebSocket;
+  private socket!: WebSocket;
   private pingInterval: number | undefined;
-  svgioEnabled: (enabled: boolean) => void;
 
   public name() {
     return "Saxi Server";
@@ -227,9 +227,6 @@ export class SaxiDriver extends BaseDriver {
         } break;
         case "dev": {
           this.ondevinfo(msg.p);
-        } break;
-        case "svgio-enabled": {
-          this.svgioEnabled(msg.p);
         } break;
         case "pause": {
           this.onpause(msg.p.paused);
