@@ -135,6 +135,8 @@ describe("camera configuration", () => {
       enabled: true,
       resolution: "",
     });
+    const link = "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_8A4F3C6F-video-index0";
+    expect(validateCameraConfig({ kind: "device", source: link }, "abc").source).toBe(link);
   });
 
   test("rejects bad input", () => {
@@ -146,7 +148,10 @@ describe("camera configuration", () => {
     bad({ kind: "url", source: "http://x", fps: 99 });
     bad({ kind: "url", source: "http://x", rotate: 45 });
     bad({ kind: "url", source: "http://x", resolution: "big" });
-    if (process.platform === "linux") bad({ kind: "device", source: "/etc/passwd" });
+    if (process.platform === "linux") {
+      bad({ kind: "device", source: "/etc/passwd" });
+      bad({ kind: "device", source: "/dev/v4l/by-id/../../../etc/passwd" });
+    }
   });
 });
 

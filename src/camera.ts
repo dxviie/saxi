@@ -12,6 +12,7 @@ import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { LINUX_DEVICE_PATH } from "./camera-devices.js";
 import {
   type CameraConfig,
   type CameraKind,
@@ -551,8 +552,8 @@ export function validateCameraConfig(input: unknown, id: string): CameraConfig {
     }
     const ok = kind === "url" ? ["http:", "https:"] : ["rtsp:", "rtsps:"];
     if (!ok.includes(url.protocol)) bad(`source must be a ${ok.join(" or ")} URL`);
-  } else if (kind === "device" && process.platform === "linux" && !/^\/dev\/video\d+$/.test(source)) {
-    bad("source must be a video device such as /dev/video0");
+  } else if (kind === "device" && process.platform === "linux" && !LINUX_DEVICE_PATH.test(source)) {
+    bad("source must be a video device such as /dev/video0 or /dev/v4l/by-id/…");
   } else if (source.startsWith("-")) {
     bad("source must not start with '-'");
   }

@@ -14,7 +14,10 @@ import {
   type TimelapseSession,
   type TimelapseSettings,
   type TimelapseStatusResponse,
+  type VideoDevice,
+  type VideoDevicesResponse,
   defaultCameraConfig,
+  sortResolutions,
 } from "./camera-types.js";
 
 export type View = "plot" | "camera";
@@ -235,6 +238,206 @@ const KIND_HELP: Record<CameraKind, { label: string; placeholder: string; help: 
   },
 };
 
+type CameraDraft = Omit<CameraConfig, "id">;
+type SetDraft = (patch: Partial<CameraDraft> | ((draft: CameraDraft) => Partial<CameraDraft>)) => void;
+
+/** Frame sizes a device offers in `inputFormat`, or in any format when ffmpeg picks one. */
+function resolutionsFor(device: VideoDevice, inputFormat: string): string[] {
+  const formats = inputFormat ? device.formats.filter((f) => f.name === inputFormat) : device.formats;
+  return sortResolutions(formats.flatMap((f) => f.resolutions));
+}
+
+/** Drops a resolution that `device` does not offer in `inputFormat`. */
+function keepResolution(draft: CameraDraft, device: VideoDevice, inputFormat: string): Partial<CameraDraft> {
+  const sizes = resolutionsFor(device, inputFormat);
+  return draft.resolution && sizes.length > 0 && !sizes.includes(draft.resolution) ? { resolution: "" } : {};
+}
+
+/** Changes for switching to `device`: its source, plus a name and input format that suit it. */
+function pickDevice(draft: CameraDraft, device: VideoDevice, devices: VideoDevice[]): Partial<CameraDraft> {
+  const previous = devices.find((d) => d.paths.includes(draft.source));
+  const patch: Partial<CameraDraft> = { source: device.source };
+  if (!draft.name.trim() || draft.name === previous?.name) patch.name = device.name;
+  let inputFormat = draft.inputFormat;
+  if (!device.formats.some((f) => f.name === inputFormat)) {
+    // Compressed video leaves USB bandwidth for other cameras, and most webcams need it for high resolutions.
+    inputFormat = device.formats.some((f) => f.name === "mjpeg") ? "mjpeg" : "";
+    patch.inputFormat = inputFormat;
+  }
+  return { ...patch, ...keepResolution(draft, device, inputFormat) };
+}
+
+const OTHER_DEVICE = "other";
+
+/** Device, input format and resolution of a local camera, offering what the server can see. */
+function DeviceFields({ draft, set, cameraId }: { draft: CameraDraft; set: SetDraft; cameraId: string | null }) {
+  const [found, setFound] = useState<VideoDevicesResponse | null>(null);
+  const [scanning, setScanning] = useState(true);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [manual, setManual] = useState(false);
+  // A new camera gets the first device no other camera uses, unless one was chosen in the meantime.
+  const autoPick = useRef(cameraId === null);
+  const mounted = useRef(false);
+
+  const scan = useCallback(async () => {
+    setScanning(true);
+    try {
+      const result = await api<VideoDevicesResponse>("GET", "/cameras/devices");
+      if (!mounted.current) return;
+      setFound(result);
+      setScanError(null);
+      const free = result.devices.find((d) => d.usedBy.length === 0);
+      if (autoPick.current && free) set((d) => pickDevice(d, free, result.devices));
+      autoPick.current = false;
+    } catch (e) {
+      if (mounted.current) setScanError((e as Error).message);
+    } finally {
+      if (mounted.current) setScanning(false);
+    }
+  }, [set]);
+
+  useEffect(() => {
+    mounted.current = true;
+    void scan();
+    return () => {
+      mounted.current = false;
+    };
+  }, [scan]);
+
+  const devices = found?.devices ?? [];
+  const current = manual ? undefined : devices.find((d) => d.paths.includes(draft.source));
+  const label = (d: VideoDevice) => {
+    const users = d.usedBy.filter((c) => c.id !== cameraId).map((c) => c.name);
+    return `${d.name} (${d.node.replace(/^\/dev\//, "")})${users.length ? ` – used by ${users.join(", ")}` : ""}`;
+  };
+  const format = current?.formats.find((f) => f.name === draft.inputFormat);
+  const sizes = current ? resolutionsFor(current, draft.inputFormat) : [];
+  // ffmpeg prefers uncompressed formats when it picks one itself
+  const uncompressed = format ? !format.compressed : current?.formats.some((f) => !f.compressed);
+
+  let help: string;
+  if (scanError) help = `Could not look for cameras: ${scanError}.`;
+  else if (!found) help = "Looking for cameras connected to the saxi server…";
+  else if (!found.supported) help = KIND_HELP.device.help;
+  else if (devices.length === 0) {
+    help =
+      "No USB cameras found on the saxi server. Check that ffmpeg is installed and that the user running saxi " +
+      "may open /dev/video* (the video group), or enter a device path.";
+  } else help = "Cameras connected to the saxi server. Pick “other…” to enter a device path yourself.";
+
+  return (
+    <>
+      {devices.length > 0 && (
+        <label>
+          device
+          <select
+            value={current?.source ?? OTHER_DEVICE}
+            onChange={(e) => {
+              autoPick.current = false;
+              const device = devices.find((d) => d.source === e.target.value);
+              setManual(!device);
+              if (device) set((d) => pickDevice(d, device, devices));
+            }}
+          >
+            {devices.map((d) => (
+              <option key={d.node} value={d.source}>
+                {label(d)}
+              </option>
+            ))}
+            <option value={OTHER_DEVICE}>other…</option>
+          </select>
+        </label>
+      )}
+      {!current && (
+        <label>
+          {devices.length > 0 ? "device path" : KIND_HELP.device.label}
+          <input
+            type="text"
+            value={draft.source}
+            placeholder={KIND_HELP.device.placeholder}
+            onChange={(e) => {
+              autoPick.current = false;
+              setManual(true); // keep the text field while typing, even if the path matches a listed camera
+              set({ source: e.target.value });
+            }}
+          />
+        </label>
+      )}
+      <div className="camera-form__help">
+        {help}
+        {found?.supported && (
+          <>
+            {" "}
+            <button type="button" className="button-link" disabled={scanning} onClick={() => void scan()}>
+              {scanning ? "scanning…" : "rescan"}
+            </button>
+          </>
+        )}
+      </div>
+      {current ? (
+        <label>
+          input format
+          <select
+            value={draft.inputFormat}
+            onChange={(e) => {
+              const inputFormat = e.target.value;
+              set((d) => ({ inputFormat, ...keepResolution(d, current, inputFormat) }));
+            }}
+          >
+            <option value="">automatic</option>
+            {current.formats.map((f) => (
+              <option key={f.name} value={f.name} title={f.description}>
+                {f.compressed ? f.name : `${f.name} (uncompressed)`}
+              </option>
+            ))}
+            {draft.inputFormat && !format && <option value={draft.inputFormat}>{draft.inputFormat}</option>}
+          </select>
+        </label>
+      ) : (
+        <label>
+          input format (optional)
+          <input
+            type="text"
+            value={draft.inputFormat}
+            placeholder="mjpeg"
+            onChange={(e) => set({ inputFormat: e.target.value })}
+          />
+        </label>
+      )}
+      {current && uncompressed && (
+        <div className="camera-form__help">
+          Uncompressed video needs far more USB bandwidth. With several cameras, pick a compressed format.
+        </div>
+      )}
+      {sizes.length > 0 ? (
+        <label>
+          resolution
+          <select value={draft.resolution} onChange={(e) => set({ resolution: e.target.value })}>
+            <option value="">camera default</option>
+            {[...sizes, ...(draft.resolution && !sizes.includes(draft.resolution) ? [draft.resolution] : [])].map(
+              (s) => (
+                <option key={s} value={s}>
+                  {s.replace("x", " × ")}
+                </option>
+              ),
+            )}
+          </select>
+        </label>
+      ) : (
+        <label>
+          resolution (optional)
+          <input
+            type="text"
+            value={draft.resolution}
+            placeholder="1920x1080"
+            onChange={(e) => set({ resolution: e.target.value })}
+          />
+        </label>
+      )}
+    </>
+  );
+}
+
 function CameraForm({
   initial,
   onSave,
@@ -255,7 +458,10 @@ function CameraForm({
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const set = (patch: Partial<typeof form>) => setForm((f) => ({ ...f, ...patch }));
+  const set = useCallback<SetDraft>(
+    (patch) => setForm((f) => ({ ...f, ...(typeof patch === "function" ? patch(f) : patch) })),
+    [],
+  );
   const kind = KIND_HELP[form.kind];
 
   const submit = async () => {
@@ -291,39 +497,34 @@ function CameraForm({
           <option value="rtsp">RTSP stream</option>
         </select>
       </label>
-      {form.kind !== "libcamera" && (
-        <label>
-          {kind.label}
-          <input
-            type="text"
-            value={form.source}
-            placeholder={kind.placeholder}
-            onChange={(e) => set({ source: e.target.value })}
-          />
-        </label>
-      )}
-      <div className="camera-form__help">{kind.help}</div>
-      {(form.kind === "device" || form.kind === "libcamera") && (
-        <label>
-          resolution (optional)
-          <input
-            type="text"
-            value={form.resolution}
-            placeholder="1920x1080"
-            onChange={(e) => set({ resolution: e.target.value })}
-          />
-        </label>
-      )}
-      {form.kind === "device" && (
-        <label>
-          input format (optional)
-          <input
-            type="text"
-            value={form.inputFormat}
-            placeholder="mjpeg"
-            onChange={(e) => set({ inputFormat: e.target.value })}
-          />
-        </label>
+      {form.kind === "device" ? (
+        <DeviceFields draft={form} set={set} cameraId={initial?.id ?? null} />
+      ) : (
+        <>
+          {form.kind !== "libcamera" && (
+            <label>
+              {kind.label}
+              <input
+                type="text"
+                value={form.source}
+                placeholder={kind.placeholder}
+                onChange={(e) => set({ source: e.target.value })}
+              />
+            </label>
+          )}
+          <div className="camera-form__help">{kind.help}</div>
+          {form.kind === "libcamera" && (
+            <label>
+              resolution (optional)
+              <input
+                type="text"
+                value={form.resolution}
+                placeholder="1920x1080"
+                onChange={(e) => set({ resolution: e.target.value })}
+              />
+            </label>
+          )}
+        </>
       )}
       <div className="flex">
         <label className="pen-label">

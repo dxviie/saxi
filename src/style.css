@@ -731,6 +731,13 @@ a.button-like:hover {
   line-height: 1.4;
   opacity: 0.8;
 }
+.camera-form__help button.button-link {
+  display: inline;
+  width: auto;
+  margin: 0;
+  font-size: inherit;
+  text-decoration: underline;
+}
 .camera-form__error {
   margin: 0.25rem 0 0.5rem;
   font-size: 11px;

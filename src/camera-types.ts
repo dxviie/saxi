@@ -54,6 +54,51 @@ export interface CameraStatus {
 
 export type CameraWithStatus = CameraConfig & { status: CameraStatus };
 
+/** A format a local capture device can deliver, as listed by ffmpeg. */
+export interface VideoDeviceFormat {
+  /** Value for a camera's `inputFormat`, e.g. `mjpeg` or `yuyv422`. */
+  name: string;
+  /** The driver's description, e.g. `Motion-JPEG` or `YUYV 4:2:2`. */
+  description: string;
+  compressed: boolean;
+  /** Frame sizes such as `1920x1080`, widest first. Empty when the device accepts any size within a range. */
+  resolutions: string[];
+}
+
+/** A capture device found on the server, offered in the camera form. */
+export interface VideoDevice {
+  /** Name reported by the driver, e.g. `HD Pro Webcam C920`. */
+  name: string;
+  /** Kernel device node, e.g. `/dev/video2`. */
+  node: string;
+  /**
+   * What to store as a camera's `source`: a /dev/v4l link that survives replugging and reboots
+   * when there is a usable one, otherwise `node`.
+   */
+  source: string;
+  /** Every path that refers to this device, including `source` and `node`. */
+  paths: string[];
+  formats: VideoDeviceFormat[];
+  /** Configured cameras that already use this device. */
+  usedBy: Array<{ id: string; name: string }>;
+}
+
+export interface VideoDevicesResponse {
+  devices: VideoDevice[];
+  /** False where saxi cannot list devices (anything but Linux for now). */
+  supported: boolean;
+}
+
+/** Sorts frame sizes such as `1280x720` widest first, then tallest, dropping duplicates. */
+export function sortResolutions(resolutions: Iterable<string>): string[] {
+  const size = (r: string) => r.split("x").map(Number);
+  return [...new Set(resolutions)].sort((a, b) => {
+    const [aw, ah] = size(a);
+    const [bw, bh] = size(b);
+    return bw - aw || bh - ah;
+  });
+}
+
 export type TimelapseTrigger = "penLift" | "interval" | "targetFrames";
 
 export interface RenderSettings {

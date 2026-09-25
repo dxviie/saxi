@@ -184,13 +184,23 @@ reach:
 
 | type | source | needs |
 |---|---|---|
-| USB / local camera | `/dev/video0` (Linux), a device index such as `0` (macOS), the device name (Windows) | `ffmpeg` |
+| USB / local camera | picked from the connected cameras or `/dev/video0` (Linux), a device index such as `0` (macOS), the device name (Windows) | `ffmpeg` |
 | Raspberry Pi camera module | (none) | `rpicam-vid` / `libcamera-vid` (Raspberry Pi OS) |
 | HTTP snapshot / MJPEG | a JPEG snapshot URL, or an MJPEG stream (IP cameras, phone camera apps, ESP32-CAM, mjpg-streamer, another Pi running [ustreamer](https://github.com/pikvm/ustreamer)…) | nothing |
 | RTSP stream | `rtsp://…` | `ffmpeg` |
 
 On a Raspberry Pi, install ffmpeg with `sudo apt install ffmpeg`. Without it,
 HTTP cameras still work but USB/RTSP cameras and video rendering are unavailable.
+
+On Linux, the camera form lists the USB cameras connected to the saxi server,
+with the input formats and resolutions each one supports, so you don't have to
+work out which `/dev/videoN` to use (most webcams create two, and only one of
+them delivers video). A camera you pick is stored by its `/dev/v4l/by-id/…`
+link, or by its `/dev/v4l/by-path/…` USB port link for identical cameras
+without a serial number, so it keeps working when the numbers change after
+replugging or a reboot. `mjpeg` is preselected when a camera offers it:
+uncompressed video needs so much USB bandwidth that several uncompressed
+cameras often cannot run at once. Pick “other…” to enter a device path yourself.
 
 A camera only streams while somebody is looking at it or a recording is in
 progress, and stops again after a few seconds of inactivity, so an idle camera

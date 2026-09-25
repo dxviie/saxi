@@ -2,6 +2,7 @@
  * HTTP API for cameras and timelapses, mounted on the saxi express app.
  *
  *   GET    /cameras                         list cameras with live status
+ *   GET    /cameras/devices                 capture devices connected to the server (Linux), for the camera form
  *   POST   /cameras                         add a camera
  *   PUT    /cameras/:id                     update a camera
  *   DELETE /cameras/:id                     remove a camera
@@ -25,6 +26,7 @@
 import type { Express, Request, Response } from "express";
 import type { TimelapseStatusResponse } from "./camera-types.js";
 import { CameraConfigError, type CameraManager } from "./camera.js";
+import { listVideoDevices } from "./camera-devices.js";
 import { TimelapseError, type TimelapseRecorder } from "./timelapse.js";
 
 /**
@@ -66,6 +68,13 @@ export function mountCameraRoutes(
   app.get("/cameras", (_req, res) => {
     res.json({ cameras: cameras.list() });
   });
+
+  app.get(
+    "/cameras/devices",
+    handler(async (_req, res) => {
+      res.json(await listVideoDevices(cameras.list()));
+    }),
+  );
 
   app.post(
     "/cameras",

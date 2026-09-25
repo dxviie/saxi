@@ -167,6 +167,13 @@ describe("camera & timelapse API", () => {
     expect((await request(server).get("/cameras/nope/snapshot.jpg")).status).toBe(404);
   });
 
+  test("lists the capture devices connected to the server", async () => {
+    const res = await request(server).get("/cameras/devices");
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.devices)).toBe(true);
+    expect(res.body.supported).toBe(process.platform === "linux");
+  });
+
   test("settings are validated and reported in status", async () => {
     const res = await request(server)
       .put("/timelapse/settings")
