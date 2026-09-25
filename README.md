@@ -217,9 +217,10 @@ the finished drawing. Frames are triggered by
 
 - **every pen lift** (with a minimum gap between frames), which gives the cleanest
   frames because the pen is off the paper,
-- **while the pen is down**: frames while the pen is drawing (at most one per
-  minimum gap) and none of the blank page or the finished drawing, which suits a
-  camera on the pen carriage,
+- **while the pen is down**: frames while the pen is drawing, at most one per
+  minimum gap and none of the blank page or the finished drawing, which suits a
+  camera on the pen carriage. Short lines and dots are over before a camera can
+  catch the pen down, so after a maximum gap any frame will do while drawing,
 - a **fixed interval**, or
 - a **target frame count**, where the interval is derived from the estimated plot
   duration so that every plot yields a video of roughly the same length.

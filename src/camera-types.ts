@@ -136,6 +136,11 @@ export interface TimelapseSettings {
   targetFrames: number;
   /** Minimum seconds between frames for the pen triggers (pen lifts can be very frequent). */
   minIntervalSeconds: number;
+  /**
+   * For `penDown`: take a frame at least this often while drawing, even when the pen isn't down long enough for
+   * one (short lines, stippling). 0 turns this off.
+   */
+  maxIntervalSeconds: number;
   /** Milliseconds to wait after a trigger before grabbing the frame, letting the machine settle. Not for `penDown`. */
   captureDelayMs: number;
   /** Render videos automatically when a recording finishes (requires ffmpeg). */
@@ -224,6 +229,7 @@ export const defaultTimelapseSettings: TimelapseSettings = {
   intervalSeconds: 5,
   targetFrames: 240,
   minIntervalSeconds: 2,
+  maxIntervalSeconds: 10,
   captureDelayMs: 250,
   autoRender: true,
   render: defaultRenderSettings,

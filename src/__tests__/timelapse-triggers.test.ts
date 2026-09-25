@@ -53,6 +53,18 @@ describe("plot clock", () => {
     expect(clock.drawing(1000, 2000)).toBe(true);
     expect(clock.drawing(2000, 3000)).toBe(false); // e.g. cancelled: nothing after 2500
   });
+
+  test("knows whether anything was drawn in a while, however briefly", () => {
+    const clock = new PlotClock(0);
+    clock.motion(lower(0.01), 0); // a dot: down 10–60
+    clock.motion(move(0.05), 0);
+    clock.motion(lift(0.01), 0);
+    clock.motion(move(1), 0); // travelling until 1070
+    expect(clock.drawing(0, 100)).toBe(false);
+    expect(clock.drewWithin(0, 100)).toBe(true);
+    expect(clock.drewWithin(100, 1000)).toBe(false); // only travelling since
+    expect(clock.drewWithin(0, 2000)).toBe(false); // the plotter is done by then
+  });
 });
 
 describe("composite alignment", () => {
@@ -158,4 +170,33 @@ describe("per-camera triggers", () => {
     }
     cameras.close();
   });
+
+  /** Stipples `dots` dots, each with the pen down for 50 ms; returns how many frames a pen-down camera took. */
+  async function stipple(maxIntervalSeconds: number, dots = 10): Promise<number> {
+    const dataDir = mkdtempSync(path.join(tmpdir(), "saxi-stipple-"));
+    const cameras = new CameraManager(dataDir, () => new StreamingSource());
+    cameras.add({ name: "Head", kind: "url", source: "http://head/", fps: 25, trigger: "penDown" });
+    const recorder = new TimelapseRecorder(cameras, dataDir);
+    recorder.updateSettings({ enabled: true, minIntervalSeconds: 0, maxIntervalSeconds, autoRender: false });
+    await recorder.plotStarted(2);
+    for (let i = 0; i < dots; i++) {
+      recorder.plotMotion(lower(0.01));
+      recorder.plotMotion(move(0.05));
+      recorder.plotMotion(lift(0.01));
+      recorder.plotMotion(move(0.1));
+    }
+    await new Promise((resolve) => setTimeout(resolve, dots * 170 + 300));
+    await recorder.plotEnded(false);
+    const frames = recorder.listSessions()[0]?.cameras[0].frameCount ?? 0;
+    cameras.close();
+    return frames;
+  }
+
+  test("dots are too brief for pen-down frames, so the maximum gap takes some anyway", async () => {
+    expect(await stipple(0)).toBe(0);
+    // ten dots take 1.7 s: a frame about every 0.4 s from the start of the plot
+    const frames = await stipple(0.4);
+    expect(frames).toBeGreaterThanOrEqual(3);
+    expect(frames).toBeLessThanOrEqual(5);
+  }, 15000);
 });

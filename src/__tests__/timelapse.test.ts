@@ -67,10 +67,13 @@ describe("settings validation", () => {
       trigger: "bogus",
       intervalSeconds: -5,
       targetFrames: "12",
+      maxIntervalSeconds: "nope",
       render: { crf: 99 },
     });
     expect(s.trigger).toBe("penLift");
     expect(s.intervalSeconds).toBe(0.5);
+    expect(s.maxIntervalSeconds).toBe(10);
+    expect(validateTimelapseSettings({ maxIntervalSeconds: -1 }).maxIntervalSeconds).toBe(0);
     expect(s.targetFrames).toBe(12);
     expect(s.render.crf).toBe(51);
     expect(s.render.preset).toBe("medium");

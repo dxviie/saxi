@@ -226,8 +226,8 @@ const TRIGGER_LABELS: Record<TimelapseTrigger, string> = {
 };
 
 const PEN_DOWN_HELP =
-  "Frames only while the pen is down and drawing, at most one per min. gap, and none of the blank page or the " +
-  "finished drawing. For short strokes, raise the capture fps.";
+  "Frames while the pen is down and drawing, at most one per min. gap, and none of the blank page or the finished " +
+  "drawing. Short lines and dots are too quick for that, so after the max. gap any frame will do while drawing.";
 
 const KIND_HELP: Record<CameraKind, { label: string; placeholder: string; help: string }> = {
   device: {
@@ -623,10 +623,13 @@ function CameraForm({
 function TimelapseSettingsForm({
   settings,
   ffmpeg,
+  penDownInUse,
   onChange,
 }: {
   settings: TimelapseSettings;
   ffmpeg: boolean;
+  /** Whether any camera captures while the pen is down, so the settings for that apply. */
+  penDownInUse: boolean;
   onChange: (patch: Partial<TimelapseSettings>) => void;
 }) {
   const render = (patch: Partial<TimelapseSettings["render"]>) =>
@@ -703,6 +706,18 @@ function TimelapseSettingsForm({
           />
         </label>
       </div>
+      {penDownInUse && (
+        <label title="While the pen is down, short lines and dots may give no frame at all: take one at least this often while drawing (0 turns this off)">
+          max. gap while the pen is down (s)
+          <input
+            type="number"
+            min="0"
+            step="1"
+            value={settings.maxIntervalSeconds}
+            onChange={(e) => onChange({ maxIntervalSeconds: num(e.target.value) })}
+          />
+        </label>
+      )}
       <label
         className="flex-checkbox"
         title={ffmpeg ? "Render videos as soon as a recording ends" : "Requires ffmpeg on the server"}
@@ -1065,7 +1080,16 @@ export function CameraView({ tabs, title }: { tabs: React.ReactNode; title: Reac
         </div>
         <div className="section-header">timelapse</div>
         <div className="section-body">
-          {status && <TimelapseSettingsForm settings={status.settings} ffmpeg={ffmpeg} onChange={saveSettings} />}
+          {status && (
+            <TimelapseSettingsForm
+              settings={status.settings}
+              ffmpeg={ffmpeg}
+              penDownInUse={
+                status.settings.trigger === "penDown" || cameras.some((c) => c.enabled && c.trigger === "penDown")
+              }
+              onChange={saveSettings}
+            />
+          )}
         </div>
         <div className="spacer" />
         <div className="control-panel-bottom">

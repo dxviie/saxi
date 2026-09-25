@@ -76,6 +76,7 @@ export function validateTimelapseSettings(
     intervalSeconds: clampNumber(o.intervalSeconds, base.intervalSeconds, 0.5, 3600),
     targetFrames: Math.round(clampNumber(o.targetFrames, base.targetFrames, 2, 100000)),
     minIntervalSeconds: clampNumber(o.minIntervalSeconds, base.minIntervalSeconds, 0, 3600),
+    maxIntervalSeconds: clampNumber(o.maxIntervalSeconds, base.maxIntervalSeconds, 0, 3600),
     captureDelayMs: Math.round(clampNumber(o.captureDelayMs, base.captureDelayMs, 0, 10000)),
     autoRender: Boolean(o.autoRender),
     render: validateRenderSettings(o.render, base.render),
@@ -131,6 +132,9 @@ function rotationFilter(rotate: CameraRotation): string[] {
 export class PlotClock {
   /** When the plotter will be done with everything sent so far. */
   private busyUntil = 0;
+
+  /** @param startedAt when the plot started */
+  public constructor(public readonly startedAt = Date.now()) {}
   /** Recent spans [from, until) with the pen on the paper; `until` is Infinity until the pen is lifted. */
   private down: Array<[number, number]> = [];
 
@@ -160,6 +164,11 @@ export class PlotClock {
   /** Whether the pen was on the paper, with the plotter drawing, all the way from `from` to `to`. */
   public drawing(from: number, to: number): boolean {
     return to <= this.busyUntil && this.down.some(([a, b]) => a <= from && to < b);
+  }
+
+  /** Whether the pen was on the paper at some point from `from` to `to`, with the plotter still at work at `to`. */
+  public drewWithin(from: number, to: number): boolean {
+    return to <= this.busyUntil && this.down.some(([a, b]) => a <= to && from < b);
   }
 }
 
@@ -512,8 +521,8 @@ export class TimelapseRecorder {
   }
 
   /**
-   * Pen-down cameras keep the frames that arrive while the plotter is drawing, at most one per minimum gap.
-   * Returns a function that stops listening.
+   * Pen-down cameras keep the frames that arrive while the plotter is drawing, at most one per minimum gap, and
+   * at least one per maximum gap. Returns a function that stops listening.
    */
   private listenWhileDrawing(active: ActiveSession): () => void {
     const stops: Array<() => void> = [];
@@ -521,10 +530,18 @@ export class TimelapseRecorder {
       let lastAt = 0;
       const onFrame = (frame: Buffer) => {
         const now = Date.now();
-        if (this.active !== active || !active.clock) return;
-        if (now - lastAt < this.settings.minIntervalSeconds * 1000) return;
+        const clock = active.clock;
+        if (this.active !== active || !clock) return;
+        const { minIntervalSeconds, maxIntervalSeconds } = this.settings;
+        if (now - lastAt < minIntervalSeconds * 1000) return;
         // the frame was taken a little before it arrived: the pen must have been down all along
-        if (!active.clock.drawing(now - FRAME_LATENCY_MS, now)) return;
+        const penDown = clock.drawing(now - FRAME_LATENCY_MS, now);
+        // Short lines and dots keep the pen down too briefly for that. Once the maximum gap has passed (since the
+        // last frame or the start of the plot), any frame will do, as long as the plotter has drawn in between.
+        const since = Math.max(lastAt, clock.startedAt);
+        const overdue =
+          maxIntervalSeconds > 0 && now - since >= maxIntervalSeconds * 1000 && clock.drewWithin(since, now);
+        if (!penDown && !overdue) return;
         lastAt = now;
         this.record(active, [[camera, frame]]).catch((e) => console.error(e));
       };
