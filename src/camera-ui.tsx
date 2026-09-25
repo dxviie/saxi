@@ -109,6 +109,46 @@ function formatElapsed(fromIso: string, toIso: string | null): string {
 // ---------------------------------------------------------------------------
 // Live view
 
+/** Draws `bitmap` onto `canvas` turned clockwise by `rotate`, sizing the canvas to fit. */
+function drawRotated(canvas: HTMLCanvasElement, bitmap: ImageBitmap, rotate: CameraRotation): void {
+  const sideways = rotate === 90 || rotate === 270;
+  canvas.width = sideways ? bitmap.height : bitmap.width;
+  canvas.height = sideways ? bitmap.width : bitmap.height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.save();
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate((rotate * Math.PI) / 180);
+  ctx.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
+  ctx.restore();
+}
+
+/** Downloads a fresh frame from `camera`, turned like the live view. */
+async function downloadStill(camera: CameraWithStatus): Promise<void> {
+  const res = await fetch(`/cameras/${camera.id}/snapshot.jpg?fresh=1&t=${Date.now()}`, { cache: "no-store" });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? `HTTP ${res.status}`);
+  }
+  const bitmap = await createImageBitmap(await res.blob());
+  const canvas = document.createElement("canvas");
+  drawRotated(canvas, bitmap, camera.rotate);
+  bitmap.close();
+  const jpeg = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => (blob ? resolve(blob) : reject(new Error("could not encode the still"))),
+      "image/jpeg",
+      0.95,
+    );
+  });
+  const url = URL.createObjectURL(jpeg);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${camera.name}.jpg`;
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
 /**
  * Polls a camera's snapshot endpoint at `fps` and draws each frame (rotated)
  * onto a canvas. The next request is only sent after the previous frame
@@ -134,20 +174,7 @@ function LiveImage({ camera, fps }: { camera: CameraWithStatus; fps: number }) {
         }
         const bitmap = await createImageBitmap(await res.blob());
         if (cancelled) return;
-        const canvas = canvasRef.current;
-        if (canvas) {
-          const sideways = rotate === 90 || rotate === 270;
-          canvas.width = sideways ? bitmap.height : bitmap.width;
-          canvas.height = sideways ? bitmap.width : bitmap.height;
-          const ctx = canvas.getContext("2d");
-          if (ctx) {
-            ctx.save();
-            ctx.translate(canvas.width / 2, canvas.height / 2);
-            ctx.rotate((rotate * Math.PI) / 180);
-            ctx.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
-            ctx.restore();
-          }
-        }
+        if (canvasRef.current) drawRotated(canvasRef.current, bitmap, rotate);
         bitmap.close();
         setError(null);
         setWaiting(false);
@@ -179,6 +206,7 @@ function LiveImage({ camera, fps }: { camera: CameraWithStatus; fps: number }) {
 
 function CameraCard({ camera, fps, onEdit }: { camera: CameraWithStatus; fps: number; onEdit: () => void }) {
   const { status } = camera;
+  const [stillError, setStillError] = useState<string | null>(null);
   const detail = [
     camera.kind,
     status.width && status.height ? `${status.width}×${status.height}` : null,
@@ -202,6 +230,12 @@ function CameraCard({ camera, fps, onEdit }: { camera: CameraWithStatus; fps: nu
             className="button-like"
             href={`/cameras/${camera.id}/snapshot.jpg?fresh=1`}
             download={`${camera.name}.jpg`}
+            onClick={(e) => {
+              setStillError(null);
+              if (!camera.rotate) return; // the camera's own JPEG, untouched
+              e.preventDefault();
+              downloadStill(camera).catch((err) => setStillError(`Could not take a still: ${(err as Error).message}`));
+            }}
           >
             still
           </a>
@@ -211,6 +245,7 @@ function CameraCard({ camera, fps, onEdit }: { camera: CameraWithStatus; fps: nu
         </div>
       </div>
       {camera.enabled && status.error && <div className="camera-card__error">{status.error}</div>}
+      {stillError && <div className="camera-card__error">{stillError}</div>}
     </div>
   );
 }
