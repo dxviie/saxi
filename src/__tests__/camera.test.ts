@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 import {
   Camera,
   CameraConfigError,
@@ -207,6 +207,27 @@ describe("sources", () => {
     camera.close();
     expect(stops).toBe(1);
     expect(camera.status.state).toBe("idle");
+  });
+
+  test("Camera reports source errors in its status instead of throwing", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const message = "ffmpeg exited (1): /dev/video2: No space left on device";
+    class FailingSource extends FrameSource {
+      protected run() {
+        // sources keep retrying, so the same error can arrive repeatedly
+        this.emit("error", new Error(message));
+        this.emit("error", new Error(message));
+      }
+      protected halt() {}
+    }
+    const config = validateCameraConfig({ kind: "device", source: "/dev/video2", name: "Side" }, "side");
+    const camera = new Camera(config, () => new FailingSource());
+    expect(() => camera.retain()).not.toThrow();
+    expect(camera.status).toMatchObject({ state: "error", error: message });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toContain("Side");
+    camera.close();
+    warn.mockRestore();
   });
 
   test("CameraManager persists cameras to disk", async () => {

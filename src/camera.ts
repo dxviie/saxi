@@ -487,8 +487,10 @@ export class Camera extends EventEmitter {
     });
     source.on("error", (err: Error) => {
       if (this.source !== source) return;
+      // Sources retry on their own, so log once when a camera starts failing rather than on every retry.
+      // Don't emit "error" here: nobody listens for it, and an unhandled "error" event would crash the server.
+      if (this.status.state !== "error") console.warn(`Camera "${this.config.name}": ${err.message}`);
       this.status = { ...this.status, state: "error", error: err.message };
-      this.emit("error", err);
     });
     source.start();
   }
