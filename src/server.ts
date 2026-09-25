@@ -29,6 +29,9 @@ import { formatDuration } from "./util.js";
 
 type Com = string;
 
+/** Before a plot, the pen moves to its starting height and the EBB waits this long before the first motion. */
+const PRE_PLOT_PEN_DELAY_MS = 1000;
+
 /**
  * Shorthand for getting the device info, either EBB or com port.
  * @param ebb
@@ -243,7 +246,7 @@ export async function startServer(
       async prePlot(initialPenHeight: number): Promise<void> {
         await ebb.configureFifoDepth();
         await ebb.enableMotors(1); // 16x microstepping, matches defaults from Axidraw
-        await ebb.setPenHeight(initialPenHeight, 1000, 1000);
+        await ebb.setPenHeight(initialPenHeight, 1000, PRE_PLOT_PEN_DELAY_MS);
       },
       async executeMotion(motion: Motion, _progress: [number, number]): Promise<void> {
         await ebb.executeMotion(motion);
@@ -271,6 +274,7 @@ export async function startServer(
     const firstPenMotion = plan.motions.find((x) => x instanceof PenMotion) as PenMotion;
     await timelapse.plotStarted(plan.duration()); // captures the blank page before anything moves
     await plotter.prePlot(firstPenMotion.initialPos);
+    timelapse.plotterBusy(PRE_PLOT_PEN_DELAY_MS); // tells the timelapse when the first motion really starts
 
     let penIsUp = true;
     try {

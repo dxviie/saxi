@@ -12,9 +12,14 @@ import {
   type CameraWithStatus,
   type RenderJob,
   type TimelapseSession,
+  TIMELAPSE_TRIGGERS,
   type TimelapseSettings,
   type TimelapseStatusResponse,
+  type TimelapseTrigger,
+  type VideoDevice,
+  type VideoDevicesResponse,
   defaultCameraConfig,
+  sortResolutions,
 } from "./camera-types.js";
 
 export type View = "plot" | "camera";
@@ -104,6 +109,46 @@ function formatElapsed(fromIso: string, toIso: string | null): string {
 // ---------------------------------------------------------------------------
 // Live view
 
+/** Draws `bitmap` onto `canvas` turned clockwise by `rotate`, sizing the canvas to fit. */
+function drawRotated(canvas: HTMLCanvasElement, bitmap: ImageBitmap, rotate: CameraRotation): void {
+  const sideways = rotate === 90 || rotate === 270;
+  canvas.width = sideways ? bitmap.height : bitmap.width;
+  canvas.height = sideways ? bitmap.width : bitmap.height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.save();
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate((rotate * Math.PI) / 180);
+  ctx.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
+  ctx.restore();
+}
+
+/** Downloads a fresh frame from `camera`, turned like the live view. */
+async function downloadStill(camera: CameraWithStatus): Promise<void> {
+  const res = await fetch(`/cameras/${camera.id}/snapshot.jpg?fresh=1&t=${Date.now()}`, { cache: "no-store" });
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(body.error ?? `HTTP ${res.status}`);
+  }
+  const bitmap = await createImageBitmap(await res.blob());
+  const canvas = document.createElement("canvas");
+  drawRotated(canvas, bitmap, camera.rotate);
+  bitmap.close();
+  const jpeg = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => (blob ? resolve(blob) : reject(new Error("could not encode the still"))),
+      "image/jpeg",
+      0.95,
+    );
+  });
+  const url = URL.createObjectURL(jpeg);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${camera.name}.jpg`;
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
 /**
  * Polls a camera's snapshot endpoint at `fps` and draws each frame (rotated)
  * onto a canvas. The next request is only sent after the previous frame
@@ -129,20 +174,7 @@ function LiveImage({ camera, fps }: { camera: CameraWithStatus; fps: number }) {
         }
         const bitmap = await createImageBitmap(await res.blob());
         if (cancelled) return;
-        const canvas = canvasRef.current;
-        if (canvas) {
-          const sideways = rotate === 90 || rotate === 270;
-          canvas.width = sideways ? bitmap.height : bitmap.width;
-          canvas.height = sideways ? bitmap.width : bitmap.height;
-          const ctx = canvas.getContext("2d");
-          if (ctx) {
-            ctx.save();
-            ctx.translate(canvas.width / 2, canvas.height / 2);
-            ctx.rotate((rotate * Math.PI) / 180);
-            ctx.drawImage(bitmap, -bitmap.width / 2, -bitmap.height / 2);
-            ctx.restore();
-          }
-        }
+        if (canvasRef.current) drawRotated(canvasRef.current, bitmap, rotate);
         bitmap.close();
         setError(null);
         setWaiting(false);
@@ -174,11 +206,13 @@ function LiveImage({ camera, fps }: { camera: CameraWithStatus; fps: number }) {
 
 function CameraCard({ camera, fps, onEdit }: { camera: CameraWithStatus; fps: number; onEdit: () => void }) {
   const { status } = camera;
+  const [stillError, setStillError] = useState<string | null>(null);
   const detail = [
     camera.kind,
     status.width && status.height ? `${status.width}×${status.height}` : null,
     `${camera.fps} fps`,
     camera.rotate ? `${camera.rotate}°` : null,
+    camera.trigger ? TRIGGER_LABELS[camera.trigger] : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -196,6 +230,12 @@ function CameraCard({ camera, fps, onEdit }: { camera: CameraWithStatus; fps: nu
             className="button-like"
             href={`/cameras/${camera.id}/snapshot.jpg?fresh=1`}
             download={`${camera.name}.jpg`}
+            onClick={(e) => {
+              setStillError(null);
+              if (!camera.rotate) return; // the camera's own JPEG, untouched
+              e.preventDefault();
+              downloadStill(camera).catch((err) => setStillError(`Could not take a still: ${(err as Error).message}`));
+            }}
           >
             still
           </a>
@@ -205,12 +245,24 @@ function CameraCard({ camera, fps, onEdit }: { camera: CameraWithStatus; fps: nu
         </div>
       </div>
       {camera.enabled && status.error && <div className="camera-card__error">{status.error}</div>}
+      {stillError && <div className="camera-card__error">{stillError}</div>}
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
 // Camera form
+
+const TRIGGER_LABELS: Record<TimelapseTrigger, string> = {
+  penLift: "every pen lift",
+  penDown: "while the pen is down",
+  interval: "fixed interval",
+  targetFrames: "target frame count",
+};
+
+const PEN_DOWN_HELP =
+  "Frames while the pen is down and drawing, at most one per min. gap, and none of the blank page or the finished " +
+  "drawing. Short lines and dots are too quick for that, so after the max. gap any frame will do while drawing.";
 
 const KIND_HELP: Record<CameraKind, { label: string; placeholder: string; help: string }> = {
   device: {
@@ -235,6 +287,213 @@ const KIND_HELP: Record<CameraKind, { label: string; placeholder: string; help: 
   },
 };
 
+type CameraDraft = Omit<CameraConfig, "id">;
+type SetDraft = (patch: Partial<CameraDraft> | ((draft: CameraDraft) => Partial<CameraDraft>)) => void;
+
+/** Frame sizes a device offers in `inputFormat`, or in any format when ffmpeg picks one. */
+function resolutionsFor(device: VideoDevice, inputFormat: string): string[] {
+  const formats = inputFormat ? device.formats.filter((f) => f.name === inputFormat) : device.formats;
+  return sortResolutions(formats.flatMap((f) => f.resolutions));
+}
+
+/** Drops a resolution that `device` does not offer in `inputFormat`. */
+function keepResolution(draft: CameraDraft, device: VideoDevice, inputFormat: string): Partial<CameraDraft> {
+  const sizes = resolutionsFor(device, inputFormat);
+  return draft.resolution && sizes.length > 0 && !sizes.includes(draft.resolution) ? { resolution: "" } : {};
+}
+
+/** Changes for switching to `device`: its source, plus a name and input format that suit it. */
+function pickDevice(draft: CameraDraft, device: VideoDevice, devices: VideoDevice[]): Partial<CameraDraft> {
+  const previous = devices.find((d) => d.paths.includes(draft.source));
+  const patch: Partial<CameraDraft> = { source: device.source };
+  if (!draft.name.trim() || draft.name === previous?.name) patch.name = device.name;
+  let inputFormat = draft.inputFormat;
+  if (!device.formats.some((f) => f.name === inputFormat)) {
+    // Compressed video leaves USB bandwidth for other cameras, and most webcams need it for high resolutions.
+    inputFormat = device.formats.some((f) => f.name === "mjpeg") ? "mjpeg" : "";
+    patch.inputFormat = inputFormat;
+  }
+  return { ...patch, ...keepResolution(draft, device, inputFormat) };
+}
+
+const OTHER_DEVICE = "other";
+
+/** Device, input format and resolution of a local camera, offering what the server can see. */
+function DeviceFields({ draft, set, cameraId }: { draft: CameraDraft; set: SetDraft; cameraId: string | null }) {
+  const [found, setFound] = useState<VideoDevicesResponse | null>(null);
+  const [scanning, setScanning] = useState(true);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [manual, setManual] = useState(false);
+  // The first scan fills in the device unless one was chosen in the meantime: the first device no other
+  // camera uses for a new camera, and the stable path of its device for one stored as /dev/videoN.
+  const suggest = useRef(true);
+  const mounted = useRef(false);
+
+  const scan = useCallback(async () => {
+    setScanning(true);
+    try {
+      const result = await api<VideoDevicesResponse>("GET", "/cameras/devices");
+      if (!mounted.current) return;
+      setFound(result);
+      setScanError(null);
+      if (suggest.current) {
+        suggest.current = false;
+        if (cameraId === null) {
+          const free = result.devices.find((d) => d.usedBy.length === 0);
+          if (free) set((d) => pickDevice(d, free, result.devices));
+        } else {
+          set((d) => ({ source: result.devices.find((x) => x.paths.includes(d.source))?.source ?? d.source }));
+        }
+      }
+    } catch (e) {
+      if (mounted.current) setScanError((e as Error).message);
+    } finally {
+      if (mounted.current) setScanning(false);
+    }
+  }, [set, cameraId]);
+
+  useEffect(() => {
+    mounted.current = true;
+    void scan();
+    return () => {
+      mounted.current = false;
+    };
+  }, [scan]);
+
+  const devices = found?.devices ?? [];
+  const current = manual ? undefined : devices.find((d) => d.paths.includes(draft.source));
+  const label = (d: VideoDevice) => {
+    const users = d.usedBy.filter((c) => c.id !== cameraId).map((c) => c.name);
+    return `${d.name} (${d.node.replace(/^\/dev\//, "")})${users.length ? ` – used by ${users.join(", ")}` : ""}`;
+  };
+  const format = current?.formats.find((f) => f.name === draft.inputFormat);
+  const sizes = current ? resolutionsFor(current, draft.inputFormat) : [];
+  // ffmpeg prefers uncompressed formats when it picks one itself
+  const uncompressed = format ? !format.compressed : current?.formats.some((f) => !f.compressed);
+
+  let help: string;
+  if (scanError) help = `Could not look for cameras: ${scanError}.`;
+  else if (!found) help = "Looking for cameras connected to the saxi server…";
+  else if (!found.supported) help = KIND_HELP.device.help;
+  else if (devices.length === 0) {
+    help =
+      "No USB cameras found on the saxi server. Check that ffmpeg is installed and that the user running saxi " +
+      "may open /dev/video* (the video group), or enter a device path.";
+  } else help = "Cameras connected to the saxi server. Pick “other…” to enter a device path yourself.";
+
+  return (
+    <>
+      {devices.length > 0 && (
+        <label>
+          device
+          <select
+            value={current?.source ?? OTHER_DEVICE}
+            onChange={(e) => {
+              suggest.current = false;
+              const device = devices.find((d) => d.source === e.target.value);
+              setManual(!device);
+              if (device) set((d) => pickDevice(d, device, devices));
+            }}
+          >
+            {devices.map((d) => (
+              <option key={d.node} value={d.source}>
+                {label(d)}
+              </option>
+            ))}
+            <option value={OTHER_DEVICE}>other…</option>
+          </select>
+        </label>
+      )}
+      {!current && (
+        <label>
+          {devices.length > 0 ? "device path" : KIND_HELP.device.label}
+          <input
+            type="text"
+            value={draft.source}
+            placeholder={KIND_HELP.device.placeholder}
+            onChange={(e) => {
+              suggest.current = false;
+              setManual(true); // keep the text field while typing, even if the path matches a listed camera
+              set({ source: e.target.value });
+            }}
+          />
+        </label>
+      )}
+      <div className="camera-form__help">
+        {help}
+        {found?.supported && (
+          <>
+            {" "}
+            <button type="button" className="button-link" disabled={scanning} onClick={() => void scan()}>
+              {scanning ? "scanning…" : "rescan"}
+            </button>
+          </>
+        )}
+      </div>
+      {current ? (
+        <label>
+          input format
+          <select
+            value={draft.inputFormat}
+            onChange={(e) => {
+              const inputFormat = e.target.value;
+              set((d) => ({ inputFormat, ...keepResolution(d, current, inputFormat) }));
+            }}
+          >
+            <option value="">automatic</option>
+            {current.formats.map((f) => (
+              <option key={f.name} value={f.name} title={f.description}>
+                {f.compressed ? f.name : `${f.name} (uncompressed)`}
+              </option>
+            ))}
+            {draft.inputFormat && !format && <option value={draft.inputFormat}>{draft.inputFormat}</option>}
+          </select>
+        </label>
+      ) : (
+        <label>
+          input format (optional)
+          <input
+            type="text"
+            value={draft.inputFormat}
+            placeholder="mjpeg"
+            onChange={(e) => set({ inputFormat: e.target.value })}
+          />
+        </label>
+      )}
+      {current && uncompressed && (
+        <div className="camera-form__help">
+          Uncompressed video needs far more USB bandwidth. With several cameras, pick a compressed format.
+        </div>
+      )}
+      {sizes.length > 0 ? (
+        <label>
+          resolution
+          <select value={draft.resolution} onChange={(e) => set({ resolution: e.target.value })}>
+            <option value="">camera default</option>
+            {[...sizes, ...(draft.resolution && !sizes.includes(draft.resolution) ? [draft.resolution] : [])].map(
+              (s) => (
+                <option key={s} value={s}>
+                  {s.replace("x", " × ")}
+                </option>
+              ),
+            )}
+          </select>
+        </label>
+      ) : (
+        <label>
+          resolution (optional)
+          <input
+            type="text"
+            value={draft.resolution}
+            placeholder="1920x1080"
+            onChange={(e) => set({ resolution: e.target.value })}
+          />
+        </label>
+      )}
+    </>
+  );
+}
+
 function CameraForm({
   initial,
   onSave,
@@ -255,7 +514,10 @@ function CameraForm({
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const set = (patch: Partial<typeof form>) => setForm((f) => ({ ...f, ...patch }));
+  const set = useCallback<SetDraft>(
+    (patch) => setForm((f) => ({ ...f, ...(typeof patch === "function" ? patch(f) : patch) })),
+    [],
+  );
   const kind = KIND_HELP[form.kind];
 
   const submit = async () => {
@@ -291,39 +553,34 @@ function CameraForm({
           <option value="rtsp">RTSP stream</option>
         </select>
       </label>
-      {form.kind !== "libcamera" && (
-        <label>
-          {kind.label}
-          <input
-            type="text"
-            value={form.source}
-            placeholder={kind.placeholder}
-            onChange={(e) => set({ source: e.target.value })}
-          />
-        </label>
-      )}
-      <div className="camera-form__help">{kind.help}</div>
-      {(form.kind === "device" || form.kind === "libcamera") && (
-        <label>
-          resolution (optional)
-          <input
-            type="text"
-            value={form.resolution}
-            placeholder="1920x1080"
-            onChange={(e) => set({ resolution: e.target.value })}
-          />
-        </label>
-      )}
-      {form.kind === "device" && (
-        <label>
-          input format (optional)
-          <input
-            type="text"
-            value={form.inputFormat}
-            placeholder="mjpeg"
-            onChange={(e) => set({ inputFormat: e.target.value })}
-          />
-        </label>
+      {form.kind === "device" ? (
+        <DeviceFields draft={form} set={set} cameraId={initial?.id ?? null} />
+      ) : (
+        <>
+          {form.kind !== "libcamera" && (
+            <label>
+              {kind.label}
+              <input
+                type="text"
+                value={form.source}
+                placeholder={kind.placeholder}
+                onChange={(e) => set({ source: e.target.value })}
+              />
+            </label>
+          )}
+          <div className="camera-form__help">{kind.help}</div>
+          {form.kind === "libcamera" && (
+            <label>
+              resolution (optional)
+              <input
+                type="text"
+                value={form.resolution}
+                placeholder="1920x1080"
+                onChange={(e) => set({ resolution: e.target.value })}
+              />
+            </label>
+          )}
+        </>
       )}
       <div className="flex">
         <label className="pen-label">
@@ -347,6 +604,18 @@ function CameraForm({
           </select>
         </label>
       </div>
+      <label title="What triggers this camera's timelapse frames">
+        timelapse trigger
+        <select value={form.trigger} onChange={(e) => set({ trigger: e.target.value as CameraDraft["trigger"] })}>
+          <option value="">as in timelapse settings</option>
+          {TIMELAPSE_TRIGGERS.map((t) => (
+            <option key={t} value={t}>
+              {TRIGGER_LABELS[t]}
+            </option>
+          ))}
+        </select>
+      </label>
+      {form.trigger === "penDown" && <div className="camera-form__help">{PEN_DOWN_HELP}</div>}
       <label className="flex-checkbox">
         <input type="checkbox" checked={form.enabled} onChange={(e) => set({ enabled: e.target.checked })} />
         enabled
@@ -389,10 +658,13 @@ function CameraForm({
 function TimelapseSettingsForm({
   settings,
   ffmpeg,
+  penDownInUse,
   onChange,
 }: {
   settings: TimelapseSettings;
   ffmpeg: boolean;
+  /** Whether any camera captures while the pen is down, so the settings for that apply. */
+  penDownInUse: boolean;
   onChange: (patch: Partial<TimelapseSettings>) => void;
 }) {
   const render = (patch: Partial<TimelapseSettings["render"]>) =>
@@ -410,11 +682,16 @@ function TimelapseSettingsForm({
           value={settings.trigger}
           onChange={(e) => onChange({ trigger: e.target.value as TimelapseSettings["trigger"] })}
         >
-          <option value="penLift">every pen lift</option>
-          <option value="interval">fixed interval</option>
-          <option value="targetFrames">target frame count</option>
+          {TIMELAPSE_TRIGGERS.map((t) => (
+            <option key={t} value={t}>
+              {TRIGGER_LABELS[t]}
+            </option>
+          ))}
         </select>
       </label>
+      <div className="camera-form__help">
+        {settings.trigger === "penDown" ? PEN_DOWN_HELP : "A camera can have its own trigger (edit the camera)."}
+      </div>
       {settings.trigger === "interval" && (
         <label title="Seconds between frames">
           interval (s)
@@ -464,6 +741,18 @@ function TimelapseSettingsForm({
           />
         </label>
       </div>
+      {penDownInUse && (
+        <label title="While the pen is down, short lines and dots may give no frame at all: take one at least this often while drawing (0 turns this off)">
+          max. gap while the pen is down (s)
+          <input
+            type="number"
+            min="0"
+            step="1"
+            value={settings.maxIntervalSeconds}
+            onChange={(e) => onChange({ maxIntervalSeconds: num(e.target.value) })}
+          />
+        </label>
+      )}
       <label
         className="flex-checkbox"
         title={ffmpeg ? "Render videos as soon as a recording ends" : "Requires ffmpeg on the server"}
@@ -628,8 +917,13 @@ function TimelapseCard({
         </div>
         <div className="timelapse-card__meta">
           {formatDate(session.startedAt)} · {formatElapsed(session.startedAt, session.finishedAt)} ·{" "}
-          {session.frameCount} frames · {session.cameras.map((c) => c.name).join(", ")} ·{" "}
-          {session.source === "plot" ? `plot, ${session.trigger}` : "manual"}
+          {session.frameCount} frames ·{" "}
+          {session.cameras
+            .map((c) =>
+              c.trigger && c.trigger !== session.trigger ? `${c.name} (${TRIGGER_LABELS[c.trigger]})` : c.name,
+            )
+            .join(", ")}{" "}
+          · {session.source === "plot" ? `plot, ${TRIGGER_LABELS[session.trigger]}` : "manual"}
         </div>
         {session.renders.length > 0 && (
           <ul className="timelapse-card__renders">
@@ -821,7 +1115,16 @@ export function CameraView({ tabs, title }: { tabs: React.ReactNode; title: Reac
         </div>
         <div className="section-header">timelapse</div>
         <div className="section-body">
-          {status && <TimelapseSettingsForm settings={status.settings} ffmpeg={ffmpeg} onChange={saveSettings} />}
+          {status && (
+            <TimelapseSettingsForm
+              settings={status.settings}
+              ffmpeg={ffmpeg}
+              penDownInUse={
+                status.settings.trigger === "penDown" || cameras.some((c) => c.enabled && c.trigger === "penDown")
+              }
+              onChange={saveSettings}
+            />
+          )}
         </div>
         <div className="spacer" />
         <div className="control-panel-bottom">

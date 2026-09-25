@@ -3,7 +3,7 @@ import type { AddressInfo } from "node:net";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 import {
   Camera,
   CameraConfigError,
@@ -11,6 +11,7 @@ import {
   FrameSource,
   JpegStreamParser,
   jpegDimensions,
+  ProcessSource,
   UrlSource,
   validateCameraConfig,
 } from "../camera.js";
@@ -135,6 +136,13 @@ describe("camera configuration", () => {
       enabled: true,
       resolution: "",
     });
+    const link = "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_8A4F3C6F-video-index0";
+    expect(validateCameraConfig({ kind: "device", source: link }, "abc").source).toBe(link);
+    // a camera follows the timelapse trigger unless it has its own
+    expect(cfg.trigger).toBe("");
+    expect(validateCameraConfig({ kind: "url", source: "http://x/", trigger: "penDown" }, "abc").trigger).toBe(
+      "penDown",
+    );
   });
 
   test("rejects bad input", () => {
@@ -146,7 +154,11 @@ describe("camera configuration", () => {
     bad({ kind: "url", source: "http://x", fps: 99 });
     bad({ kind: "url", source: "http://x", rotate: 45 });
     bad({ kind: "url", source: "http://x", resolution: "big" });
-    if (process.platform === "linux") bad({ kind: "device", source: "/etc/passwd" });
+    bad({ kind: "url", source: "http://x", trigger: "sometimes" });
+    if (process.platform === "linux") {
+      bad({ kind: "device", source: "/etc/passwd" });
+      bad({ kind: "device", source: "/dev/v4l/by-id/../../../etc/passwd" });
+    }
   });
 });
 
@@ -191,6 +203,7 @@ describe("sources", () => {
       protected halt() {
         stops += 1;
         if (this.timer) clearInterval(this.timer);
+        return Promise.resolve();
       }
     }
     const config: CameraConfig = validateCameraConfig({ kind: "url", source: "http://x/", name: "fake" }, "fake");
@@ -207,6 +220,102 @@ describe("sources", () => {
     camera.close();
     expect(stops).toBe(1);
     expect(camera.status.state).toBe("idle");
+  });
+
+  test("Camera reports source errors in its status instead of throwing", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const busy = (address: string) =>
+      `ffmpeg exited (240): [in#0 @ ${address}] Error opening input: Device or resource busy`;
+    const bandwidth = "ffmpeg exited (228): [in#0 @ 0x62b2] Error opening input: No space left on device";
+    class FailingSource extends FrameSource {
+      protected run() {
+        // Sources keep retrying, so the same error arrives again, with other addresses in ffmpeg's output,
+        // until the camera fails for another reason.
+        this.emit("error", new Error(busy("0x5e40")));
+        this.emit("error", new Error(busy("0x636d")));
+        this.emit("error", new Error(bandwidth));
+      }
+      protected halt() {
+        return Promise.resolve();
+      }
+    }
+    const config = validateCameraConfig({ kind: "device", source: "/dev/video2", name: "Side" }, "side");
+    const camera = new Camera(config, () => new FailingSource());
+    expect(() => camera.retain()).not.toThrow();
+    const hinted = `Not enough USB bandwidth: use mjpeg or a lower resolution, or move a camera to another USB port. ${bandwidth}`;
+    expect(camera.status).toMatchObject({ state: "error", error: hinted });
+    // logged when the camera starts failing and when it fails differently, not on every retry
+    expect(warn.mock.calls.map((call) => String(call[0]))).toEqual([
+      `Camera "Side": Another program, or another camera in saxi, is using this device. ${busy("0x5e40")}`,
+      `Camera "Side": ${hinted}`,
+    ]);
+    camera.close();
+    warn.mockRestore();
+  });
+
+  test("Camera waits for a stopped source to let go of the device before starting the next", async () => {
+    const events: string[] = [];
+    const exits: Array<() => void> = [];
+    class ExitingSource extends FrameSource {
+      constructor(private readonly n: number) {
+        super();
+      }
+      protected run() {
+        events.push(`start ${this.n}`);
+      }
+      protected halt() {
+        events.push(`stop ${this.n}`);
+        return new Promise<void>((resolve) => exits.push(resolve));
+      }
+    }
+    let n = 0;
+    const config = validateCameraConfig({ kind: "device", source: "/dev/video2", name: "Side" }, "side");
+    const camera = new Camera(config, () => new ExitingSource(++n));
+    camera.retain();
+    camera.updateConfig({ ...config, fps: 5 }); // restarts the running camera, like saving the camera form
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(events).toEqual(["start 1", "stop 1"]);
+    exits[0](); // the first process exits
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(events).toEqual(["start 1", "stop 1", "start 2"]);
+    camera.close();
+  });
+
+  test("ProcessSource reports the line saying what went wrong, not ffmpeg's closing lines", async () => {
+    const stderr = [
+      "[video4linux2,v4l2 @ 0x55d0c8a1e2c0] ioctl(VIDIOC_STREAMON): No space left on device",
+      "[in#0 @ 0x62b29b18ae00] Error opening input: No space left on device",
+      "Error opening input file /dev/video2.",
+      "Error opening input files: No space left on device",
+    ].join("\n");
+    const script = `process.stderr.write(${JSON.stringify(stderr)}); process.exitCode = 228;`;
+    const source = new ProcessSource(process.execPath, ["-e", script]);
+    const error = await new Promise<Error>((resolve) => {
+      source.on("error", resolve);
+      source.start();
+    });
+    await source.stop();
+    expect(error.message).toBe(
+      `${process.execPath} exited (228): [video4linux2,v4l2 @ 0x55d0c8a1e2c0] ioctl(VIDIOC_STREAMON): No space left on device | [in#0 @ 0x62b29b18ae00] Error opening input: No space left on device`,
+    );
+  });
+
+  // Windows has no SIGTERM to handle: the process is ended right away.
+  test.skipIf(process.platform === "win32")("ProcessSource.stop resolves once the process has exited", async () => {
+    const script = [
+      // like ffmpeg, which only exits once the camera delivers its next frame (set up before the first
+      // frame, which is when the test stops it)
+      "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 300));",
+      "process.stdout.write(require('fs').readFileSync(process.argv[1]));",
+      "setInterval(() => {}, 1000);",
+    ].join("\n");
+    const source = new ProcessSource(process.execPath, ["-e", script, path.join(__dirname, "fixtures", "frame.jpg")]);
+    const frame = new Promise((resolve) => source.once("frame", resolve));
+    source.start();
+    await frame;
+    const began = Date.now();
+    await source.stop();
+    expect(Date.now() - began).toBeGreaterThanOrEqual(250);
   });
 
   test("CameraManager persists cameras to disk", async () => {

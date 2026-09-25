@@ -67,10 +67,13 @@ describe("settings validation", () => {
       trigger: "bogus",
       intervalSeconds: -5,
       targetFrames: "12",
+      maxIntervalSeconds: "nope",
       render: { crf: 99 },
     });
     expect(s.trigger).toBe("penLift");
     expect(s.intervalSeconds).toBe(0.5);
+    expect(s.maxIntervalSeconds).toBe(10);
+    expect(validateTimelapseSettings({ maxIntervalSeconds: -1 }).maxIntervalSeconds).toBe(0);
     expect(s.targetFrames).toBe(12);
     expect(s.render.crf).toBe(51);
     expect(s.render.preset).toBe("medium");
@@ -165,6 +168,13 @@ describe("camera & timelapse API", () => {
     expect(updated.status).toBe(200);
     expect(updated.body.rotate).toBe(180);
     expect((await request(server).get("/cameras/nope/snapshot.jpg")).status).toBe(404);
+  });
+
+  test("lists the capture devices connected to the server", async () => {
+    const res = await request(server).get("/cameras/devices");
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.devices)).toBe(true);
+    expect(res.body.supported).toBe(process.platform === "linux");
   });
 
   test("settings are validated and reported in status", async () => {

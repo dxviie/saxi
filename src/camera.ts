@@ -12,6 +12,7 @@ import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { LINUX_DEVICE_PATH } from "./camera-devices.js";
 import {
   type CameraConfig,
   type CameraKind,
@@ -20,6 +21,8 @@ import {
   type CameraWithStatus,
   type Capabilities,
   defaultCameraConfig,
+  TIMELAPSE_TRIGGERS,
+  type TimelapseTrigger,
 } from "./camera-types.js";
 
 // ---------------------------------------------------------------------------
@@ -147,12 +150,13 @@ export abstract class FrameSource extends EventEmitter {
     this.started = true;
     this.run();
   }
-  public stop(): void {
+  /** Stops the source. Resolves once it has let go of the camera, which a process can take a moment to do. */
+  public stop(): Promise<void> {
     this.started = false;
-    this.halt();
+    return this.halt();
   }
   protected abstract run(): void;
-  protected abstract halt(): void;
+  protected abstract halt(): Promise<void>;
 }
 
 const RESTART_DELAY_MS = 3000;
@@ -202,11 +206,19 @@ export class ProcessSource extends FrameSource {
       }
       this.fail(err.code === "ENOENT" ? new Error(`${this.command} not found. Is it installed?`) : err);
     });
-    child.on("exit", (code, signal) => {
+    // "close" rather than "exit", so that all of stderr has been read
+    child.on("close", (code, signal) => {
       if (this.child !== child) return;
       this.child = null;
       if (!this.started) return;
-      const detail = this.stderrTail.trim().split("\n").filter(Boolean).slice(-3).join(" | ");
+      // ffmpeg 6 and later end with generic lines ("Error opening input file …", "Error opening input files: …")
+      // that would push out the line saying what went wrong.
+      const detail = this.stderrTail
+        .trim()
+        .split("\n")
+        .filter((line) => line && !/^Error opening (input|output) files?\b/.test(line))
+        .slice(-3)
+        .join(" | ");
       this.fail(new Error(`${this.command} exited (${signal ?? code})${detail ? `: ${detail}` : ""}`));
     });
   }
@@ -224,18 +236,28 @@ export class ProcessSource extends FrameSource {
     }, delayMs);
   }
 
-  protected halt(): void {
+  protected halt(): Promise<void> {
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
     }
     const child = this.child;
     this.child = null;
-    if (child) {
+    if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+    // The device stays busy until the process has exited, which ffmpeg only does once the camera
+    // delivers its next frame.
+    return new Promise((resolve) => {
+      const timers: NodeJS.Timeout[] = [];
+      const done = () => {
+        for (const timer of timers) clearTimeout(timer);
+        resolve();
+      };
+      timers.push(setTimeout(() => child.kill("SIGKILL"), 2000));
+      timers.push(setTimeout(done, 3000)); // a process stuck in the kernel may not even die from SIGKILL
+      child.once("exit", done);
+      child.once("error", done);
       child.kill("SIGTERM");
-      const killer = setTimeout(() => child.kill("SIGKILL"), 2000);
-      child.once("exit", () => clearTimeout(killer));
-    }
+    });
   }
 }
 
@@ -317,13 +339,14 @@ export class UrlSource extends FrameSource {
     });
   }
 
-  protected halt(): void {
+  protected halt(): Promise<void> {
     this.controller?.abort();
     this.controller = null;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    return Promise.resolve();
   }
 }
 
@@ -381,10 +404,35 @@ export function createFrameSource(config: CameraConfig): FrameSource {
 /** How long a camera keeps streaming after the last preview request. */
 const IDLE_TIMEOUT_MS = 15000;
 
+/** What usually causes the errors USB cameras run into, going by the system error ffmpeg reports. */
+const DEVICE_HINTS: Array<[RegExp, string]> = [
+  [
+    /No space left on device/,
+    "Not enough USB bandwidth: use mjpeg or a lower resolution, or move a camera to another USB port.",
+  ],
+  [/Device or resource busy/, "Another program, or another camera in saxi, is using this device."],
+  [/Inappropriate ioctl for device/, "This is not the camera's video device: pick the camera from the list."],
+  [/Permission denied/, "saxi may not open this device: add the user running saxi to the video group."],
+  [/No such file or directory/, "The camera is not connected, or its device path has changed."],
+];
+
+function withHint(message: string): string {
+  const hint = DEVICE_HINTS.find(([pattern]) => pattern.test(message))?.[1];
+  return hint ? `${hint} ${message}` : message;
+}
+
+/** Whether two errors are the same apart from the addresses in ffmpeg's log prefixes, like `[in#0 @ 0x5e40…]`. */
+function sameError(a: string, b: string | null): boolean {
+  const strip = (message: string) => message.replace(/ @ 0x[0-9a-f]+/gi, "");
+  return b !== null && strip(a) === strip(b);
+}
+
 export class Camera extends EventEmitter {
   public config: CameraConfig;
   public status: CameraStatus = { state: "idle", error: null, lastFrameAt: null, width: null, height: null, frames: 0 };
   private source: FrameSource | null = null;
+  /** Settles once the sources stopped so far have let go of the camera; null when none is stopping. */
+  private stopping: Promise<void> | null = null;
   private latest: Buffer | null = null;
   private retains = 0;
   private idleTimer: NodeJS.Timeout | null = null;
@@ -487,10 +535,22 @@ export class Camera extends EventEmitter {
     });
     source.on("error", (err: Error) => {
       if (this.source !== source) return;
-      this.status = { ...this.status, state: "error", error: err.message };
-      this.emit("error", err);
+      const message = this.config.kind === "device" ? withHint(err.message) : err.message;
+      // Sources retry on their own, so log when a camera starts failing or fails differently, not on every retry.
+      // Don't emit "error" here: nobody listens for it, and an unhandled "error" event would crash the server.
+      if (this.status.state !== "error" || !sameError(message, this.status.error)) {
+        console.warn(`Camera "${this.config.name}": ${message}`);
+      }
+      this.status = { ...this.status, state: "error", error: message };
     });
-    source.start();
+    if (this.stopping) {
+      // Opening the device while the previous process still has it fails with "Device or resource busy".
+      void this.stopping.then(() => {
+        if (this.source === source) source.start();
+      });
+    } else {
+      source.start();
+    }
   }
 
   private scheduleIdleStop(idleMs = IDLE_TIMEOUT_MS): void {
@@ -511,7 +571,10 @@ export class Camera extends EventEmitter {
     this.source = null;
     if (source) {
       source.removeAllListeners();
-      source.stop();
+      const stopping: Promise<void> = Promise.all([this.stopping, source.stop()]).then(() => {
+        if (this.stopping === stopping) this.stopping = null;
+      });
+      this.stopping = stopping;
     }
     this.status = { ...this.status, state: "idle", error: null };
   }
@@ -549,8 +612,8 @@ export function validateCameraConfig(input: unknown, id: string): CameraConfig {
     }
     const ok = kind === "url" ? ["http:", "https:"] : ["rtsp:", "rtsps:"];
     if (!ok.includes(url.protocol)) bad(`source must be a ${ok.join(" or ")} URL`);
-  } else if (kind === "device" && process.platform === "linux" && !/^\/dev\/video\d+$/.test(source)) {
-    bad("source must be a video device such as /dev/video0");
+  } else if (kind === "device" && process.platform === "linux" && !LINUX_DEVICE_PATH.test(source)) {
+    bad("source must be a video device such as /dev/video0 or /dev/v4l/by-id/…");
   } else if (source.startsWith("-")) {
     bad("source must not start with '-'");
   }
@@ -562,8 +625,10 @@ export function validateCameraConfig(input: unknown, id: string): CameraConfig {
   if (!Number.isFinite(fps) || fps < 0.2 || fps > 30) bad("fps must be between 0.2 and 30");
   const rotate = Number(o.rotate) as CameraRotation;
   if (!ROTATIONS.includes(rotate)) bad("rotate must be 0, 90, 180 or 270");
+  const trigger = (typeof o.trigger === "string" ? o.trigger : "") as TimelapseTrigger | "";
+  if (trigger && !TIMELAPSE_TRIGGERS.includes(trigger)) bad(`trigger must be one of ${TIMELAPSE_TRIGGERS.join(", ")}`);
   const name = (typeof o.name === "string" ? o.name.trim() : "").slice(0, 60) || `Camera ${id.slice(0, 4)}`;
-  return { id, name, kind, source, resolution, inputFormat, fps, rotate, enabled: Boolean(o.enabled) };
+  return { id, name, kind, source, resolution, inputFormat, fps, rotate, trigger, enabled: Boolean(o.enabled) };
 }
 
 // ---------------------------------------------------------------------------

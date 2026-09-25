@@ -184,13 +184,24 @@ reach:
 
 | type | source | needs |
 |---|---|---|
-| USB / local camera | `/dev/video0` (Linux), a device index such as `0` (macOS), the device name (Windows) | `ffmpeg` |
+| USB / local camera | picked from the connected cameras or `/dev/video0` (Linux), a device index such as `0` (macOS), the device name (Windows) | `ffmpeg` |
 | Raspberry Pi camera module | (none) | `rpicam-vid` / `libcamera-vid` (Raspberry Pi OS) |
 | HTTP snapshot / MJPEG | a JPEG snapshot URL, or an MJPEG stream (IP cameras, phone camera apps, ESP32-CAM, mjpg-streamer, another Pi running [ustreamer](https://github.com/pikvm/ustreamer)…) | nothing |
 | RTSP stream | `rtsp://…` | `ffmpeg` |
 
 On a Raspberry Pi, install ffmpeg with `sudo apt install ffmpeg`. Without it,
 HTTP cameras still work but USB/RTSP cameras and video rendering are unavailable.
+
+On Linux, the camera form lists the USB cameras connected to the saxi server,
+with the input formats and resolutions each one supports, so you don't have to
+work out which `/dev/videoN` to use (most webcams create two, and only one of
+them delivers video). A camera you pick is stored by its `/dev/v4l/by-id/…`
+link, or by its `/dev/v4l/by-path/…` USB port link for identical cameras
+without a serial number, so it keeps working when the numbers change after
+replugging or a reboot (a camera set up with `/dev/videoN` switches over when
+you edit and save it). `mjpeg` is preselected when a camera offers it:
+uncompressed video needs so much USB bandwidth that several uncompressed
+cameras often cannot run at once. Pick “other…” to enter a device path yourself.
 
 A camera only streams while somebody is looking at it or a recording is in
 progress, and stops again after a few seconds of inactivity, so an idle camera
@@ -206,21 +217,32 @@ the finished drawing. Frames are triggered by
 
 - **every pen lift** (with a minimum gap between frames), which gives the cleanest
   frames because the pen is off the paper,
+- **while the pen is down**: frames while the pen is drawing, at most one per
+  minimum gap and none of the blank page or the finished drawing, which suits a
+  camera on the pen carriage. Short lines and dots are over before a camera can
+  catch the pen down, so after a maximum gap any frame will do while drawing,
 - a **fixed interval**, or
 - a **target frame count**, where the interval is derived from the estimated plot
   duration so that every plot yields a video of roughly the same length.
 
-You can also start a recording by hand and take snapshots whenever you like.
-When a recording ends it is rendered (if ffmpeg is available) to one MP4 per
-camera plus a side-by-side composite of all cameras; fps, quality, x264 preset,
-post-roll and composite are configurable and any recording can be re-rendered
-later with different settings. Rendering on a Raspberry Pi is slow, so pick a fast
+A camera can have its own trigger (edit the camera), e.g. an overview camera on
+pen lifts and a carriage camera while the pen is down. Since saxi sends motions
+to the plotter well ahead of time, the pen triggers go by when the plotter
+actually gets to each motion, worked out from the plan's timing.
+
+You can also start a recording by hand and take snapshots (of every camera)
+whenever you like. When a recording ends it is rendered (if ffmpeg is available)
+to one MP4 per camera plus a side-by-side composite of all cameras, in which each
+camera shows its latest frame at every moment any camera captured. Fps, quality,
+x264 preset, post-roll and composite are configurable and any recording can be
+re-rendered later with different settings. Rendering on a Raspberry Pi is slow, so pick a fast
 preset there or copy the frames elsewhere.
 
 Everything is stored under `~/.saxi` (override with `--data-dir` or
 `SAXI_DATA_DIR`): `cameras.json`, `timelapse.json` and one directory per
 recording in `timelapses/` containing `<camera>/frame-000001.jpg …`, the rendered
-videos in `renders/` and a `timelapse.json` describing the recording. Keep an eye
+videos in `renders/`, a `timelapse.json` describing the recording and a
+`timeline.txt` of which camera captured which frame when. Keep an eye
 on free disk space: a long plot with several full-resolution cameras adds up.
 
 The camera tab is only available when running the saxi server (not on the

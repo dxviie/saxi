@@ -34,6 +34,8 @@ export interface CameraConfig {
   fps: number;
   /** Rotation applied when previewing and rendering (frames are stored as captured). */
   rotate: CameraRotation;
+  /** What triggers this camera's timelapse frames. Empty follows the timelapse settings. */
+  trigger: TimelapseTrigger | "";
   /** Disabled cameras are not previewed or recorded. */
   enabled: boolean;
 }
@@ -54,7 +56,62 @@ export interface CameraStatus {
 
 export type CameraWithStatus = CameraConfig & { status: CameraStatus };
 
-export type TimelapseTrigger = "penLift" | "interval" | "targetFrames";
+/** A format a local capture device can deliver, as listed by ffmpeg. */
+export interface VideoDeviceFormat {
+  /** Value for a camera's `inputFormat`, e.g. `mjpeg` or `yuyv422`. */
+  name: string;
+  /** The driver's description, e.g. `Motion-JPEG` or `YUYV 4:2:2`. */
+  description: string;
+  compressed: boolean;
+  /** Frame sizes such as `1920x1080`, widest first. Empty when the device accepts any size within a range. */
+  resolutions: string[];
+}
+
+/** A capture device found on the server, offered in the camera form. */
+export interface VideoDevice {
+  /** Name reported by the driver, e.g. `HD Pro Webcam C920`. */
+  name: string;
+  /** Kernel device node, e.g. `/dev/video2`. */
+  node: string;
+  /**
+   * What to store as a camera's `source`: a /dev/v4l link that survives replugging and reboots
+   * when there is a usable one, otherwise `node`.
+   */
+  source: string;
+  /** Every path that refers to this device, including `source` and `node`. */
+  paths: string[];
+  formats: VideoDeviceFormat[];
+  /** Configured cameras that already use this device. */
+  usedBy: Array<{ id: string; name: string }>;
+}
+
+export interface VideoDevicesResponse {
+  devices: VideoDevice[];
+  /** False where saxi cannot list devices (anything but Linux for now). */
+  supported: boolean;
+}
+
+/** Sorts frame sizes such as `1280x720` widest first, then tallest, dropping duplicates. */
+export function sortResolutions(resolutions: Iterable<string>): string[] {
+  const size = (r: string) => r.split("x").map(Number);
+  return [...new Set(resolutions)].sort((a, b) => {
+    const [aw, ah] = size(a);
+    const [bw, bh] = size(b);
+    return bw - aw || bh - ah;
+  });
+}
+
+/**
+ * What triggers timelapse frames while plotting:
+ * - `penLift`: every pen lift, once the pen is off the paper.
+ * - `penDown`: while the pen is down and drawing; no frames of the blank page or the finished drawing,
+ *   which suits a camera on the pen carriage.
+ * - `interval`: a fixed interval.
+ * - `targetFrames`: an interval derived from the plot duration, for a set number of frames.
+ */
+export type TimelapseTrigger = "penLift" | "penDown" | "interval" | "targetFrames";
+
+export const TIMELAPSE_TRIGGERS: TimelapseTrigger[] = ["penLift", "penDown", "interval", "targetFrames"];
 
 export interface RenderSettings {
   /** Output frame rate of the rendered video. */
@@ -77,9 +134,14 @@ export interface TimelapseSettings {
   intervalSeconds: number;
   /** Desired number of frames for the `targetFrames` trigger; the interval is derived from the plan duration. */
   targetFrames: number;
-  /** Minimum seconds between frames for the `penLift` trigger (pen lifts can be very frequent). */
+  /** Minimum seconds between frames for the pen triggers (pen lifts can be very frequent). */
   minIntervalSeconds: number;
-  /** Milliseconds to wait after a trigger before grabbing the frame, letting the machine settle. */
+  /**
+   * For `penDown`: take a frame at least this often while drawing, even when the pen isn't down long enough for
+   * one (short lines, stippling). 0 turns this off.
+   */
+  maxIntervalSeconds: number;
+  /** Milliseconds to wait after a trigger before grabbing the frame, letting the machine settle. Not for `penDown`. */
   captureDelayMs: number;
   /** Render videos automatically when a recording finishes (requires ffmpeg). */
   autoRender: boolean;
@@ -92,6 +154,8 @@ export interface TimelapseCameraInfo {
   id: string;
   name: string;
   rotate: CameraRotation;
+  /** What triggered this camera's frames. Missing in recordings from before cameras had their own trigger. */
+  trigger?: TimelapseTrigger;
   /** Number of frame files stored for this camera. */
   frameCount: number;
   width: number | null;
@@ -116,7 +180,7 @@ export interface TimelapseSession {
   status: TimelapseStatus;
   source: "plot" | "manual";
   trigger: TimelapseTrigger;
-  /** Number of capture events (frame sets). */
+  /** Number of moments at which frames were captured (by any camera). */
   frameCount: number;
   cameras: TimelapseCameraInfo[];
   renders: TimelapseRender[];
@@ -165,6 +229,7 @@ export const defaultTimelapseSettings: TimelapseSettings = {
   intervalSeconds: 5,
   targetFrames: 240,
   minIntervalSeconds: 2,
+  maxIntervalSeconds: 10,
   captureDelayMs: 250,
   autoRender: true,
   render: defaultRenderSettings,
@@ -178,5 +243,6 @@ export const defaultCameraConfig: Omit<CameraConfig, "id"> = {
   inputFormat: "",
   fps: 2,
   rotate: 0,
+  trigger: "",
   enabled: true,
 };
