@@ -217,21 +217,31 @@ the finished drawing. Frames are triggered by
 
 - **every pen lift** (with a minimum gap between frames), which gives the cleanest
   frames because the pen is off the paper,
+- **while the pen is down**: frames while the pen is drawing (at most one per
+  minimum gap) and none of the blank page or the finished drawing, which suits a
+  camera on the pen carriage,
 - a **fixed interval**, or
 - a **target frame count**, where the interval is derived from the estimated plot
   duration so that every plot yields a video of roughly the same length.
 
-You can also start a recording by hand and take snapshots whenever you like.
-When a recording ends it is rendered (if ffmpeg is available) to one MP4 per
-camera plus a side-by-side composite of all cameras; fps, quality, x264 preset,
-post-roll and composite are configurable and any recording can be re-rendered
-later with different settings. Rendering on a Raspberry Pi is slow, so pick a fast
+A camera can have its own trigger (edit the camera), e.g. an overview camera on
+pen lifts and a carriage camera while the pen is down. Since saxi sends motions
+to the plotter well ahead of time, the pen triggers go by when the plotter
+actually gets to each motion, worked out from the plan's timing.
+
+You can also start a recording by hand and take snapshots (of every camera)
+whenever you like. When a recording ends it is rendered (if ffmpeg is available)
+to one MP4 per camera plus a side-by-side composite of all cameras, in which each
+camera shows its latest frame at every moment any camera captured. Fps, quality,
+x264 preset, post-roll and composite are configurable and any recording can be
+re-rendered later with different settings. Rendering on a Raspberry Pi is slow, so pick a fast
 preset there or copy the frames elsewhere.
 
 Everything is stored under `~/.saxi` (override with `--data-dir` or
 `SAXI_DATA_DIR`): `cameras.json`, `timelapse.json` and one directory per
 recording in `timelapses/` containing `<camera>/frame-000001.jpg …`, the rendered
-videos in `renders/` and a `timelapse.json` describing the recording. Keep an eye
+videos in `renders/`, a `timelapse.json` describing the recording and a
+`timeline.txt` of which camera captured which frame when. Keep an eye
 on free disk space: a long plot with several full-resolution cameras adds up.
 
 The camera tab is only available when running the saxi server (not on the

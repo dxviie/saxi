@@ -21,6 +21,8 @@ import {
   type CameraWithStatus,
   type Capabilities,
   defaultCameraConfig,
+  TIMELAPSE_TRIGGERS,
+  type TimelapseTrigger,
 } from "./camera-types.js";
 
 // ---------------------------------------------------------------------------
@@ -623,8 +625,10 @@ export function validateCameraConfig(input: unknown, id: string): CameraConfig {
   if (!Number.isFinite(fps) || fps < 0.2 || fps > 30) bad("fps must be between 0.2 and 30");
   const rotate = Number(o.rotate) as CameraRotation;
   if (!ROTATIONS.includes(rotate)) bad("rotate must be 0, 90, 180 or 270");
+  const trigger = (typeof o.trigger === "string" ? o.trigger : "") as TimelapseTrigger | "";
+  if (trigger && !TIMELAPSE_TRIGGERS.includes(trigger)) bad(`trigger must be one of ${TIMELAPSE_TRIGGERS.join(", ")}`);
   const name = (typeof o.name === "string" ? o.name.trim() : "").slice(0, 60) || `Camera ${id.slice(0, 4)}`;
-  return { id, name, kind, source, resolution, inputFormat, fps, rotate, enabled: Boolean(o.enabled) };
+  return { id, name, kind, source, resolution, inputFormat, fps, rotate, trigger, enabled: Boolean(o.enabled) };
 }
 
 // ---------------------------------------------------------------------------

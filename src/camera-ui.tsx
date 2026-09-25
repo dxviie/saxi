@@ -12,8 +12,10 @@ import {
   type CameraWithStatus,
   type RenderJob,
   type TimelapseSession,
+  TIMELAPSE_TRIGGERS,
   type TimelapseSettings,
   type TimelapseStatusResponse,
+  type TimelapseTrigger,
   type VideoDevice,
   type VideoDevicesResponse,
   defaultCameraConfig,
@@ -182,6 +184,7 @@ function CameraCard({ camera, fps, onEdit }: { camera: CameraWithStatus; fps: nu
     status.width && status.height ? `${status.width}×${status.height}` : null,
     `${camera.fps} fps`,
     camera.rotate ? `${camera.rotate}°` : null,
+    camera.trigger ? TRIGGER_LABELS[camera.trigger] : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -214,6 +217,17 @@ function CameraCard({ camera, fps, onEdit }: { camera: CameraWithStatus; fps: nu
 
 // ---------------------------------------------------------------------------
 // Camera form
+
+const TRIGGER_LABELS: Record<TimelapseTrigger, string> = {
+  penLift: "every pen lift",
+  penDown: "while the pen is down",
+  interval: "fixed interval",
+  targetFrames: "target frame count",
+};
+
+const PEN_DOWN_HELP =
+  "Frames only while the pen is down and drawing, at most one per min. gap, and none of the blank page or the " +
+  "finished drawing. For short strokes, raise the capture fps.";
 
 const KIND_HELP: Record<CameraKind, { label: string; placeholder: string; help: string }> = {
   device: {
@@ -555,6 +569,18 @@ function CameraForm({
           </select>
         </label>
       </div>
+      <label title="What triggers this camera's timelapse frames">
+        timelapse trigger
+        <select value={form.trigger} onChange={(e) => set({ trigger: e.target.value as CameraDraft["trigger"] })}>
+          <option value="">as in timelapse settings</option>
+          {TIMELAPSE_TRIGGERS.map((t) => (
+            <option key={t} value={t}>
+              {TRIGGER_LABELS[t]}
+            </option>
+          ))}
+        </select>
+      </label>
+      {form.trigger === "penDown" && <div className="camera-form__help">{PEN_DOWN_HELP}</div>}
       <label className="flex-checkbox">
         <input type="checkbox" checked={form.enabled} onChange={(e) => set({ enabled: e.target.checked })} />
         enabled
@@ -618,11 +644,16 @@ function TimelapseSettingsForm({
           value={settings.trigger}
           onChange={(e) => onChange({ trigger: e.target.value as TimelapseSettings["trigger"] })}
         >
-          <option value="penLift">every pen lift</option>
-          <option value="interval">fixed interval</option>
-          <option value="targetFrames">target frame count</option>
+          {TIMELAPSE_TRIGGERS.map((t) => (
+            <option key={t} value={t}>
+              {TRIGGER_LABELS[t]}
+            </option>
+          ))}
         </select>
       </label>
+      <div className="camera-form__help">
+        {settings.trigger === "penDown" ? PEN_DOWN_HELP : "A camera can have its own trigger (edit the camera)."}
+      </div>
       {settings.trigger === "interval" && (
         <label title="Seconds between frames">
           interval (s)
@@ -836,8 +867,13 @@ function TimelapseCard({
         </div>
         <div className="timelapse-card__meta">
           {formatDate(session.startedAt)} · {formatElapsed(session.startedAt, session.finishedAt)} ·{" "}
-          {session.frameCount} frames · {session.cameras.map((c) => c.name).join(", ")} ·{" "}
-          {session.source === "plot" ? `plot, ${session.trigger}` : "manual"}
+          {session.frameCount} frames ·{" "}
+          {session.cameras
+            .map((c) =>
+              c.trigger && c.trigger !== session.trigger ? `${c.name} (${TRIGGER_LABELS[c.trigger]})` : c.name,
+            )
+            .join(", ")}{" "}
+          · {session.source === "plot" ? `plot, ${TRIGGER_LABELS[session.trigger]}` : "manual"}
         </div>
         {session.renders.length > 0 && (
           <ul className="timelapse-card__renders">

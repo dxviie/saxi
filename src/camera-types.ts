@@ -34,6 +34,8 @@ export interface CameraConfig {
   fps: number;
   /** Rotation applied when previewing and rendering (frames are stored as captured). */
   rotate: CameraRotation;
+  /** What triggers this camera's timelapse frames. Empty follows the timelapse settings. */
+  trigger: TimelapseTrigger | "";
   /** Disabled cameras are not previewed or recorded. */
   enabled: boolean;
 }
@@ -99,7 +101,17 @@ export function sortResolutions(resolutions: Iterable<string>): string[] {
   });
 }
 
-export type TimelapseTrigger = "penLift" | "interval" | "targetFrames";
+/**
+ * What triggers timelapse frames while plotting:
+ * - `penLift`: every pen lift, once the pen is off the paper.
+ * - `penDown`: while the pen is down and drawing; no frames of the blank page or the finished drawing,
+ *   which suits a camera on the pen carriage.
+ * - `interval`: a fixed interval.
+ * - `targetFrames`: an interval derived from the plot duration, for a set number of frames.
+ */
+export type TimelapseTrigger = "penLift" | "penDown" | "interval" | "targetFrames";
+
+export const TIMELAPSE_TRIGGERS: TimelapseTrigger[] = ["penLift", "penDown", "interval", "targetFrames"];
 
 export interface RenderSettings {
   /** Output frame rate of the rendered video. */
@@ -122,9 +134,9 @@ export interface TimelapseSettings {
   intervalSeconds: number;
   /** Desired number of frames for the `targetFrames` trigger; the interval is derived from the plan duration. */
   targetFrames: number;
-  /** Minimum seconds between frames for the `penLift` trigger (pen lifts can be very frequent). */
+  /** Minimum seconds between frames for the pen triggers (pen lifts can be very frequent). */
   minIntervalSeconds: number;
-  /** Milliseconds to wait after a trigger before grabbing the frame, letting the machine settle. */
+  /** Milliseconds to wait after a trigger before grabbing the frame, letting the machine settle. Not for `penDown`. */
   captureDelayMs: number;
   /** Render videos automatically when a recording finishes (requires ffmpeg). */
   autoRender: boolean;
@@ -137,6 +149,8 @@ export interface TimelapseCameraInfo {
   id: string;
   name: string;
   rotate: CameraRotation;
+  /** What triggered this camera's frames. Missing in recordings from before cameras had their own trigger. */
+  trigger?: TimelapseTrigger;
   /** Number of frame files stored for this camera. */
   frameCount: number;
   width: number | null;
@@ -161,7 +175,7 @@ export interface TimelapseSession {
   status: TimelapseStatus;
   source: "plot" | "manual";
   trigger: TimelapseTrigger;
-  /** Number of capture events (frame sets). */
+  /** Number of moments at which frames were captured (by any camera). */
   frameCount: number;
   cameras: TimelapseCameraInfo[];
   renders: TimelapseRender[];
@@ -223,5 +237,6 @@ export const defaultCameraConfig: Omit<CameraConfig, "id"> = {
   inputFormat: "",
   fps: 2,
   rotate: 0,
+  trigger: "",
   enabled: true,
 };

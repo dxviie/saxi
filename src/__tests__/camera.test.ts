@@ -138,6 +138,11 @@ describe("camera configuration", () => {
     });
     const link = "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_8A4F3C6F-video-index0";
     expect(validateCameraConfig({ kind: "device", source: link }, "abc").source).toBe(link);
+    // a camera follows the timelapse trigger unless it has its own
+    expect(cfg.trigger).toBe("");
+    expect(validateCameraConfig({ kind: "url", source: "http://x/", trigger: "penDown" }, "abc").trigger).toBe(
+      "penDown",
+    );
   });
 
   test("rejects bad input", () => {
@@ -149,6 +154,7 @@ describe("camera configuration", () => {
     bad({ kind: "url", source: "http://x", fps: 99 });
     bad({ kind: "url", source: "http://x", rotate: 45 });
     bad({ kind: "url", source: "http://x", resolution: "big" });
+    bad({ kind: "url", source: "http://x", trigger: "sometimes" });
     if (process.platform === "linux") {
       bad({ kind: "device", source: "/etc/passwd" });
       bad({ kind: "device", source: "/dev/v4l/by-id/../../../etc/passwd" });
@@ -297,9 +303,10 @@ describe("sources", () => {
   // Windows has no SIGTERM to handle: the process is ended right away.
   test.skipIf(process.platform === "win32")("ProcessSource.stop resolves once the process has exited", async () => {
     const script = [
-      "process.stdout.write(require('fs').readFileSync(process.argv[1]));",
-      // like ffmpeg, which only exits once the camera delivers its next frame
+      // like ffmpeg, which only exits once the camera delivers its next frame (set up before the first
+      // frame, which is when the test stops it)
       "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 300));",
+      "process.stdout.write(require('fs').readFileSync(process.argv[1]));",
       "setInterval(() => {}, 1000);",
     ].join("\n");
     const source = new ProcessSource(process.execPath, ["-e", script, path.join(__dirname, "fixtures", "frame.jpg")]);

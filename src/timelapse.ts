@@ -1,16 +1,20 @@
 /**
  * Timelapse recording and rendering.
  *
- * A recording ("session") captures synchronized frame sets from every enabled
- * camera into `<dataDir>/timelapses/<session>/<cameraId>/frame-000001.jpg`,
- * either automatically while a plot runs (triggered by pen lifts or on an
- * interval) or manually. Finished sessions can be rendered to MP4 with ffmpeg,
- * one video per camera plus an optional multi-camera composite.
+ * A recording ("session") captures frames from every enabled camera into
+ * `<dataDir>/timelapses/<session>/<cameraId>/frame-000001.jpg`, either
+ * automatically while a plot runs or manually. Each camera captures on its own
+ * trigger (pen lifts, while the pen is down, or on an interval), or the one of
+ * the timelapse settings; cameras sharing a trigger capture together. The
+ * moments frames were captured at are kept in `timeline.txt`, so that a
+ * composite can show every camera's latest frame at each of them. Finished
+ * sessions can be rendered to MP4 with ffmpeg, one video per camera plus an
+ * optional multi-camera composite.
  */
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { rm, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, link, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { type Camera, type CameraManager, jpegDimensions, newId } from "./camera.js";
 import {
@@ -22,12 +26,12 @@ import {
   type TimelapseCameraInfo,
   type TimelapseSession,
   type TimelapseSettings,
+  TIMELAPSE_TRIGGERS,
   type TimelapseStatus,
   type TimelapseTrigger,
 } from "./camera-types.js";
 import { PenMotion, type Motion } from "./planning.js";
 
-const TRIGGERS: TimelapseTrigger[] = ["penLift", "interval", "targetFrames"];
 const PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"];
 const SAFE_NAME = /^[A-Za-z0-9._-]+$/;
 
@@ -63,7 +67,9 @@ export function validateTimelapseSettings(
   base: TimelapseSettings = defaultTimelapseSettings,
 ): TimelapseSettings {
   const o = { ...base, ...((typeof input === "object" && input) || {}) } as Record<string, unknown>;
-  const trigger = TRIGGERS.includes(o.trigger as TimelapseTrigger) ? (o.trigger as TimelapseTrigger) : base.trigger;
+  const trigger = TIMELAPSE_TRIGGERS.includes(o.trigger as TimelapseTrigger)
+    ? (o.trigger as TimelapseTrigger)
+    : base.trigger;
   return {
     enabled: Boolean(o.enabled),
     trigger,
@@ -117,18 +123,125 @@ function rotationFilter(rotate: CameraRotation): string[] {
   }
 }
 
+/**
+ * When the plotter really gets to the motions it is sent. saxi keeps the EBB's motion queue full, so a motion
+ * can run seconds after it was sent; the plan's durations tell when. The estimate catches up whenever the
+ * queue runs dry, e.g. while paused.
+ */
+export class PlotClock {
+  /** When the plotter will be done with everything sent so far. */
+  private busyUntil = 0;
+  /** Recent spans [from, until) with the pen on the paper; `until` is Infinity until the pen is lifted. */
+  private down: Array<[number, number]> = [];
+
+  /** The plotter is busy for `ms` before it gets to the next motion. */
+  public wait(ms: number, now = Date.now()): void {
+    this.busyUntil = Math.max(now, this.busyUntil) + ms;
+  }
+
+  /** Reports a motion as it is sent. Returns when the plotter will run it. */
+  public motion(motion: Motion, now = Date.now()): { start: number; end: number } {
+    const start = Math.max(now, this.busyUntil);
+    const end = start + motion.duration() * 1000;
+    this.busyUntil = end;
+    if (motion instanceof PenMotion) {
+      const last = this.down.at(-1);
+      if (motion.initialPos > motion.finalPos) {
+        // lowering: on the paper once the move is done
+        if (last?.[1] !== Infinity) this.down.push([end, Infinity]);
+      } else if (motion.initialPos < motion.finalPos && last && last[1] === Infinity) {
+        last[1] = start; // lifting: off the paper as soon as it starts
+      }
+      this.down = this.down.filter(([, until]) => until > now - 60_000);
+    }
+    return { start, end };
+  }
+
+  /** Whether the pen was on the paper, with the plotter drawing, all the way from `from` to `to`. */
+  public drawing(from: number, to: number): boolean {
+    return to <= this.busyUntil && this.down.some(([a, b]) => a <= from && to < b);
+  }
+}
+
+/**
+ * How long before it arrives a frame may have been taken (camera, USB and ffmpeg all add latency). A pen-down
+ * camera only keeps a frame if the pen was down for this long before it arrived.
+ */
+const FRAME_LATENCY_MS = 300;
+
+/** Per recording, one line per moment at which frames were captured: `<camera>:<frame number>` for each camera. */
+const TIMELINE = "timeline.txt";
+
+/** Where a composite render finds each camera's frame for every moment, linked in step. */
+const COMPOSITE_FRAMES = "composite-frames";
+
+/** The cameras of a recording that share a trigger. */
+interface TriggerGroup {
+  trigger: TimelapseTrigger;
+  cameras: Camera[];
+  /** When the group last captured, or is about to (pen lifts are captured once the pen is up). */
+  lastCaptureAt: number;
+  /** Seconds between frames for the timed triggers. */
+  intervalSeconds: number;
+  timer: NodeJS.Timeout | null;
+}
+
 interface ActiveSession {
   session: TimelapseSession;
   dir: string;
   cameras: Camera[];
+  groups: TriggerGroup[];
   releases: Array<() => void>;
   lastFrames: Map<string, Buffer>;
-  capturing: boolean;
-  lastCaptureAt: number;
-  intervalTimer: NodeJS.Timeout | null;
-  /** Interval currently in use for timed triggers, in seconds. */
-  intervalSeconds: number;
-  plotAttached: boolean;
+  /** Cameras with a capture in flight, which triggers skip. */
+  busy: Set<string>;
+  /** Frames are written one moment at a time, in order. */
+  writes: Promise<void>;
+  /** Captures waiting for the plotter to get to a pen lift. */
+  pending: Set<NodeJS.Timeout>;
+  /** Set while a plot is attached. */
+  clock: PlotClock | null;
+  stopListening: () => void;
+}
+
+/**
+ * For a composite of `cameras`, the frame each camera shows at every moment of a recording: its latest one,
+ * or its first before it has any. `timeline` is null for recordings from before cameras had their own
+ * triggers, in which every moment had a frame from every camera.
+ */
+export function alignMoments(timeline: string | null, cameras: TimelapseCameraInfo[]): number[][] {
+  const moments: Array<Map<string, number>> =
+    timeline === null
+      ? Array.from(
+          { length: Math.max(0, ...cameras.map((c) => c.frameCount)) },
+          (_, i) => new Map(cameras.map((c) => [c.id, Math.min(i + 1, c.frameCount)])),
+        )
+      : timeline
+          .split("\n")
+          .filter(Boolean)
+          .map(
+            (line) =>
+              new Map(
+                line.split(" ").map((entry): [string, number] => {
+                  const [id, n] = entry.split(":");
+                  return [id, Number(n)];
+                }),
+              ),
+          );
+  const current = cameras.map(() => 0);
+  const aligned: number[][] = [];
+  for (const moment of moments) {
+    let changed = false;
+    cameras.forEach((camera, i) => {
+      const n = moment.get(camera.id);
+      if (n !== undefined && n >= 1 && n <= camera.frameCount) {
+        current[i] = n;
+        changed = true;
+      }
+    });
+    if (changed) aligned.push(current.map((n) => Math.max(n, 1)));
+  }
+  return aligned;
 }
 
 export class TimelapseRecorder {
@@ -258,6 +371,7 @@ export class TimelapseRecorder {
     const rawName = (opts.name ?? "").trim();
     const name = rawName || `${opts.source} ${now.toLocaleString()}`;
     const id = `${stamp}-${slug(rawName || opts.source)}-${newId().slice(0, 4)}`;
+    const triggerOf = (camera: Camera) => camera.config.trigger || this.settings.trigger;
     const session: TimelapseSession = {
       id,
       name,
@@ -271,6 +385,7 @@ export class TimelapseRecorder {
         id: c.config.id,
         name: c.config.name,
         rotate: c.config.rotate,
+        trigger: triggerOf(c),
         frameCount: 0,
         width: null,
         height: null,
@@ -281,37 +396,49 @@ export class TimelapseRecorder {
     for (const camera of cameras) mkdirSync(path.join(dir, camera.config.id), { recursive: true });
     await this.writeSession(session);
 
+    const groups: TriggerGroup[] = [];
+    for (const camera of cameras) {
+      const trigger = triggerOf(camera);
+      const group = groups.find((g) => g.trigger === trigger);
+      if (group) group.cameras.push(camera);
+      else {
+        groups.push({ trigger, cameras: [camera], lastCaptureAt: 0, intervalSeconds: 0, timer: null });
+      }
+    }
     const active: ActiveSession = {
       session,
       dir,
       cameras,
+      groups,
       releases: cameras.map((c) => c.retain()),
       lastFrames: new Map(),
-      capturing: false,
-      lastCaptureAt: 0,
-      intervalTimer: null,
-      intervalSeconds: this.settings.intervalSeconds,
-      plotAttached: false,
+      busy: new Set(),
+      writes: Promise.resolve(),
+      pending: new Set(),
+      clock: null,
+      stopListening: () => {},
     };
+    active.stopListening = this.listenWhileDrawing(active);
     this.active = active;
     console.log(`Timelapse ${id}: recording with ${cameras.map((c) => c.config.name).join(", ")}`);
 
     if (opts.source === "plot") {
       this.attachPlot(active, opts.planDurationSeconds);
-    } else if (this.settings.trigger !== "penLift") {
-      this.startIntervalTimer(active);
+    } else {
+      for (const group of groups) group.intervalSeconds = this.settings.intervalSeconds;
+      this.startTimers(active);
     }
     return session;
   }
 
-  /** Capture one frame set into the active recording. Resolves with the new frame count. */
+  /** Capture a frame from every camera into the active recording. Resolves with the new frame count. */
   public async snap(): Promise<number> {
     const active = this.active;
     if (!active) throw new TimelapseError("no recording in progress", 409);
-    // Unlike automatic triggers, a manual snapshot waits for an in-flight capture instead of being dropped.
-    for (let i = 0; i < 200 && active.capturing; i++) await sleep(50);
+    // Unlike automatic triggers, a manual snapshot waits for captures in flight instead of skipping those cameras.
+    await this.idle(active, active.cameras);
     if (this.active !== active) throw new TimelapseError("recording stopped", 409);
-    const captured = await this.captureSet(active, 0);
+    const captured = await this.captureSet(active, active.cameras, 0);
     if (!captured) throw new TimelapseError("a capture is already in progress, try again", 429);
     return active.session.frameCount;
   }
@@ -320,97 +447,168 @@ export class TimelapseRecorder {
     const active = this.active;
     if (!active) throw new TimelapseError("no recording in progress", 409);
     this.active = null;
-    if (active.intervalTimer) clearInterval(active.intervalTimer);
-    // let an in-flight capture land before releasing the cameras
-    for (let i = 0; i < 100 && active.capturing; i++) await sleep(50);
+    this.detach(active, true);
+    // let captures in flight land before releasing the cameras
+    await this.idle(active, active.cameras);
+    await active.writes;
     for (const release of active.releases) release();
     const session = active.session;
     session.status = session.frameCount === 0 && status === "finished" ? "failed" : status;
     session.finishedAt = new Date().toISOString();
     await this.writeSession(session);
-    console.log(`Timelapse ${session.id}: ${session.status} with ${session.frameCount} frame sets`);
+    const counts = session.cameras.map((c) => `${c.name} ${c.frameCount}`).join(", ");
+    console.log(`Timelapse ${session.id}: ${session.status} with ${session.frameCount} frame sets (${counts})`);
     if (session.status !== "failed" && this.settings.autoRender && (await this.cameras.getCapabilities()).ffmpeg) {
       this.render(session.id, {});
     }
     return session;
   }
 
-  private startIntervalTimer(active: ActiveSession): void {
-    if (active.intervalTimer) clearInterval(active.intervalTimer);
-    active.intervalTimer = setInterval(
-      () => void this.captureSet(active, this.settings.captureDelayMs),
-      Math.max(500, active.intervalSeconds * 1000),
-    );
+  /** Stops what a plot drives, or with `everything`, all of a recording's triggers. */
+  private detach(active: ActiveSession, everything: boolean): void {
+    active.clock = null;
+    for (const timer of active.pending) clearTimeout(timer);
+    active.pending.clear();
+    if (everything || active.session.source === "plot") {
+      for (const group of active.groups) {
+        if (group.timer) clearInterval(group.timer);
+        group.timer = null;
+      }
+    }
+    if (everything) active.stopListening();
+  }
+
+  /** Waits (up to five seconds) until none of `cameras` has a capture in flight. */
+  private async idle(active: ActiveSession, cameras: Camera[]): Promise<void> {
+    for (let i = 0; i < 100 && cameras.some((c) => active.busy.has(c.config.id)); i++) await sleep(50);
+  }
+
+  private startTimers(active: ActiveSession): void {
+    for (const group of active.groups) {
+      if (group.trigger !== "interval" && group.trigger !== "targetFrames") continue;
+      if (group.timer) clearInterval(group.timer);
+      group.timer = setInterval(
+        () => void this.captureSet(active, group.cameras, this.settings.captureDelayMs),
+        Math.max(500, group.intervalSeconds * 1000),
+      );
+    }
   }
 
   private attachPlot(active: ActiveSession, planDurationSeconds?: number): void {
-    active.plotAttached = true;
+    active.clock = new PlotClock();
     const s = this.settings;
-    if (s.trigger === "targetFrames" && planDurationSeconds && planDurationSeconds > 0) {
-      active.intervalSeconds = Math.max(s.minIntervalSeconds, planDurationSeconds / s.targetFrames);
-    } else {
-      active.intervalSeconds = s.intervalSeconds;
+    for (const group of active.groups) {
+      group.intervalSeconds =
+        group.trigger === "targetFrames" && planDurationSeconds && planDurationSeconds > 0
+          ? Math.max(s.minIntervalSeconds, planDurationSeconds / s.targetFrames)
+          : s.intervalSeconds;
     }
-    if (s.trigger !== "penLift") this.startIntervalTimer(active);
+    this.startTimers(active);
+  }
+
+  /** Cameras that capture the blank page and the finished drawing: all but the pen-down ones. */
+  private pageCameras(active: ActiveSession): Camera[] {
+    return active.groups.filter((g) => g.trigger !== "penDown").flatMap((g) => g.cameras);
   }
 
   /**
-   * Capture a synchronized frame from every camera in the session.
-   * Returns false when a capture was already in progress (the trigger is dropped).
+   * Pen-down cameras keep the frames that arrive while the plotter is drawing, at most one per minimum gap.
+   * Returns a function that stops listening.
    */
-  private async captureSet(active: ActiveSession, delayMs: number): Promise<boolean> {
-    if (active.capturing) return false;
-    active.capturing = true;
+  private listenWhileDrawing(active: ActiveSession): () => void {
+    const stops: Array<() => void> = [];
+    for (const camera of active.groups.find((g) => g.trigger === "penDown")?.cameras ?? []) {
+      let lastAt = 0;
+      const onFrame = (frame: Buffer) => {
+        const now = Date.now();
+        if (this.active !== active || !active.clock) return;
+        if (now - lastAt < this.settings.minIntervalSeconds * 1000) return;
+        // the frame was taken a little before it arrived: the pen must have been down all along
+        if (!active.clock.drawing(now - FRAME_LATENCY_MS, now)) return;
+        lastAt = now;
+        this.record(active, [[camera, frame]]).catch((e) => console.error(e));
+      };
+      camera.on("frame", onFrame);
+      stops.push(() => camera.off("frame", onFrame));
+    }
+    return () => {
+      for (const stop of stops) stop();
+    };
+  }
+
+  /**
+   * Capture a frame from each of `cameras` into the active recording, as one moment. Cameras still busy with
+   * an earlier capture are skipped. Returns false when there was nothing to capture.
+   */
+  private async captureSet(active: ActiveSession, cameras: Camera[], delayMs: number): Promise<boolean> {
+    const free = cameras.filter((c) => !active.busy.has(c.config.id));
+    if (free.length === 0) return false;
+    for (const camera of free) active.busy.add(camera.config.id);
     try {
       if (delayMs > 0) await sleep(delayMs);
       if (this.active !== active) return false;
       const results = await Promise.all(
-        active.cameras.map((camera) =>
+        free.map((camera) =>
           camera
             .getFrame({ fresh: true, timeoutMs: Math.max(5000, (2 * 1000) / camera.config.fps + 1000) })
             .then((frame) => ({ camera, frame, error: null as Error | null }))
             .catch((error: Error) => ({ camera, frame: null as Buffer | null, error })),
         ),
       );
-      let wroteAny = false;
+      const frames: Array<[Camera, Buffer]> = [];
       for (const { camera, frame, error } of results) {
-        const id = camera.config.id;
-        const info = active.session.cameras.find((c) => c.id === id);
-        if (!info) continue;
-        let data = frame;
-        if (!data) {
-          data = active.lastFrames.get(id) ?? null;
+        const data = frame ?? active.lastFrames.get(camera.config.id) ?? null;
+        if (!frame) {
           console.warn(
             `Timelapse ${active.session.id}: ${camera.config.name}: ${error?.message ?? "no frame"}${data ? " (repeating previous frame)" : ""}`,
           );
-          if (!data) continue;
-        } else {
-          active.lastFrames.set(id, data);
         }
-        const file = path.join(active.dir, id, `frame-${pad6(info.frameCount + 1)}.jpg`);
-        try {
-          await writeFile(file, data);
-        } catch (e) {
-          console.error(`Timelapse ${active.session.id}: could not write ${file}: ${(e as Error).message}`);
-          continue;
-        }
-        info.frameCount += 1;
-        if (info.width === null) {
-          const dims = jpegDimensions(data);
-          info.width = dims?.width ?? null;
-          info.height = dims?.height ?? null;
-        }
-        wroteAny = true;
+        if (data) frames.push([camera, data]);
       }
-      if (wroteAny) {
-        active.session.frameCount += 1;
-        active.lastCaptureAt = Date.now();
-        await this.writeSession(active.session);
+      await this.record(active, frames);
+      const now = Date.now();
+      for (const group of active.groups) {
+        if (group.cameras.some((c) => free.includes(c))) group.lastCaptureAt = Math.max(group.lastCaptureAt, now);
       }
       return true;
     } finally {
-      active.capturing = false;
+      for (const camera of free) active.busy.delete(camera.config.id);
     }
+  }
+
+  /** Stores a frame per camera as one moment of the recording. Moments are written one at a time, in order. */
+  private record(active: ActiveSession, frames: Array<[Camera, Buffer]>): Promise<void> {
+    const write = active.writes.then(() => this.writeFrames(active, frames));
+    active.writes = write.catch(() => {});
+    return write;
+  }
+
+  private async writeFrames(active: ActiveSession, frames: Array<[Camera, Buffer]>): Promise<void> {
+    const moment: string[] = [];
+    for (const [camera, data] of frames) {
+      const id = camera.config.id;
+      const info = active.session.cameras.find((c) => c.id === id);
+      if (!info) continue;
+      const file = path.join(active.dir, id, `frame-${pad6(info.frameCount + 1)}.jpg`);
+      try {
+        await writeFile(file, data);
+      } catch (e) {
+        console.error(`Timelapse ${active.session.id}: could not write ${file}: ${(e as Error).message}`);
+        continue;
+      }
+      info.frameCount += 1;
+      active.lastFrames.set(id, data);
+      if (info.width === null) {
+        const dims = jpegDimensions(data);
+        info.width = dims?.width ?? null;
+        info.height = dims?.height ?? null;
+      }
+      moment.push(`${id}:${info.frameCount}`);
+    }
+    if (moment.length === 0) return;
+    active.session.frameCount += 1;
+    await appendFile(path.join(active.dir, TIMELINE), `${moment.join(" ")}\n`);
+    await this.writeSession(active.session);
   }
 
   // ----- plot hooks (never throw; plotting must not fail because of a camera)
@@ -427,34 +625,46 @@ export class TimelapseRecorder {
       } else {
         this.attachPlot(active, planDurationSeconds);
       }
-      await bounded(this.captureSet(active, 0), 10000);
+      await bounded(this.captureSet(active, this.pageCameras(active), 0), 10000);
     } catch (e) {
       console.error(`Timelapse: could not start recording: ${(e as Error).message}`);
     }
   }
 
-  /** Called for every motion executed while plotting. */
+  /** Called when the plotter is busy for `ms` before its first motion, e.g. moving the pen to its start height. */
+  public plotterBusy(ms: number): void {
+    this.active?.clock?.wait(ms);
+  }
+
+  /** Called for every motion as it is sent to the plotter. */
   public plotMotion(motion: Motion): void {
     const active = this.active;
-    if (!active?.plotAttached || this.settings.trigger !== "penLift") return;
+    if (!active?.clock) return;
+    const { end } = active.clock.motion(motion);
     if (!(motion instanceof PenMotion) || !(motion.initialPos < motion.finalPos)) return; // only pen lifts
-    if (Date.now() - active.lastCaptureAt < this.settings.minIntervalSeconds * 1000) return;
-    void this.captureSet(active, this.settings.captureDelayMs).catch((e) => console.error(e));
+    // The plotter gets to this lift after what is queued before it: capture once the pen is actually up.
+    const at = end + this.settings.captureDelayMs;
+    for (const group of active.groups) {
+      if (group.trigger !== "penLift" || at - group.lastCaptureAt < this.settings.minIntervalSeconds * 1000) continue;
+      group.lastCaptureAt = at;
+      const timer = setTimeout(() => {
+        active.pending.delete(timer);
+        this.captureSet(active, group.cameras, 0).catch((e) => console.error(e));
+      }, at - Date.now());
+      active.pending.add(timer);
+    }
   }
 
   /** Called once the plot has finished or was cancelled and the machine is idle. */
   public async plotEnded(cancelled: boolean): Promise<void> {
     const active = this.active;
-    if (!active?.plotAttached) return;
+    if (!active?.clock) return;
     try {
-      active.plotAttached = false;
-      if (active.intervalTimer && active.session.source === "plot") {
-        clearInterval(active.intervalTimer);
-        active.intervalTimer = null;
-      }
-      // final frame: the finished drawing (wait for any in-flight capture first)
-      for (let i = 0; i < 100 && active.capturing; i++) await sleep(50);
-      await bounded(this.captureSet(active, this.settings.captureDelayMs), 10000);
+      this.detach(active, false);
+      // final frame: the finished drawing (wait for captures in flight first)
+      const cameras = this.pageCameras(active);
+      await this.idle(active, cameras);
+      await bounded(this.captureSet(active, cameras, this.settings.captureDelayMs), 10000);
       if (active.session.source === "plot") {
         await this.stop(cancelled ? "cancelled" : "finished");
       }
@@ -528,12 +738,14 @@ export class TimelapseRecorder {
     const file = `${label}-${settings.fps}fps-${stamp}.mp4`;
     const output = path.join(rendersDir, file);
     const subject = job.camera === "composite" ? cameras : cameras.filter((c) => c.id === job.camera);
-    const totalFrames =
-      Math.min(...subject.map((c) => c.frameCount)) + Math.ceil(settings.postRollSeconds * settings.fps);
-    const args = buildFfmpegArgs(dir, subject, settings, output);
+    let inputDir = dir;
 
     console.log(`Timelapse ${session.id}: rendering ${file}`);
     try {
+      let frames = Math.min(...subject.map((c) => c.frameCount));
+      if (job.camera === "composite") ({ inputDir, frames } = await this.linkComposite(dir, subject));
+      const totalFrames = frames + Math.ceil(settings.postRollSeconds * settings.fps);
+      const args = buildFfmpegArgs(inputDir, subject, settings, output);
       await new Promise<void>((resolve, reject) => {
         const child = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
         let stderr = "";
@@ -578,7 +790,32 @@ export class TimelapseRecorder {
       job.error = (e as Error).message;
       console.error(`Timelapse ${session.id}: render failed: ${job.error}`);
       await rm(output, { force: true }).catch(() => {});
+    } finally {
+      if (inputDir !== dir) await rm(inputDir, { recursive: true, force: true }).catch(() => {});
     }
+  }
+
+  /**
+   * Links every camera's frame for each moment of the recording into COMPOSITE_FRAMES, so that ffmpeg can read
+   * the cameras in step even when they captured at different moments.
+   */
+  private async linkComposite(
+    dir: string,
+    cameras: TimelapseCameraInfo[],
+  ): Promise<{ inputDir: string; frames: number }> {
+    const timeline = await readFile(path.join(dir, TIMELINE), "utf8").catch(() => null);
+    const moments = alignMoments(timeline, cameras);
+    const inputDir = path.join(dir, COMPOSITE_FRAMES);
+    await rm(inputDir, { recursive: true, force: true });
+    for (const [i, camera] of cameras.entries()) {
+      await mkdir(path.join(inputDir, camera.id), { recursive: true });
+      for (const [k, frames] of moments.entries()) {
+        const source = path.join(dir, camera.id, `frame-${pad6(frames[i])}.jpg`);
+        const target = path.join(inputDir, camera.id, `frame-${pad6(k + 1)}.jpg`);
+        await link(source, target).catch(() => copyFile(source, target)); // e.g. no hard links on FAT
+      }
+    }
+    return { inputDir, frames: moments.length };
   }
 
   public close(): void {
@@ -586,7 +823,7 @@ export class TimelapseRecorder {
     if (this.active) {
       const active = this.active;
       this.active = null;
-      if (active.intervalTimer) clearInterval(active.intervalTimer);
+      this.detach(active, true);
       for (const release of active.releases) release();
       active.session.status = "cancelled";
       active.session.finishedAt = new Date().toISOString();
