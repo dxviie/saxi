@@ -26,8 +26,13 @@ const ESC = "\x1b";
 
 /** HP-GL bytes allowed in flight without an answer. The 7475A buffers 1024. */
 const DEFAULT_WINDOW = 900;
-/** With a hardware handshake the port stops by itself; the window then only bounds how long a cancel takes. */
-const HANDSHAKE_WINDOW = 4096;
+/**
+ * With a hardware handshake the port stops by itself, and the window only bounds what waits in the serial port's
+ * buffer, behind which a cancel (ESC . K) or a status check has to queue: about a second's worth at 9600 baud.
+ */
+const HANDSHAKE_WINDOW = 2048;
+/** The 7475A's input buffer. */
+const BUFFER_BYTES = 1024;
 /** Instructions are sent in chunks of about this many bytes, each followed by an output instruction. */
 const CHUNK_BYTES = 192;
 
@@ -54,10 +59,6 @@ export interface HpglPlotterOptions {
   timeoutMs?: number;
   /** How often to check the plotter's status (ESC . O), in ms. 0 turns it off. */
   pollMs?: number;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** What the extended status (ESC . O) says needs doing, if anything. */
@@ -108,7 +109,12 @@ export class HpglPlotter implements PlotterDriver {
   private sent = 0;
   private acked = 0;
   private waiters: Array<() => void> = [];
-  private cancelled = false;
+  /** Changes with every plot and every cancel: what an earlier one still has on its way is dropped. */
+  private generation = 0;
+  /** The generation of the plot in progress: once a cancel has moved on, its sends stop. */
+  private plotGeneration = -1;
+  /** The plot in progress was cancelled: further cancels are ignored until it is over. */
+  private cancelling = false;
   private plotting = false;
   private encoder: HpglEncoder | null = null;
   private pen = 1;
@@ -208,7 +214,6 @@ export class HpglPlotter implements PlotterDriver {
       p.reject(new Error(reason));
     }
     this.pending = [];
-    this.cancelled = true;
     this.wake();
     this.markClosed();
   }
@@ -236,6 +241,8 @@ export class HpglPlotter implements PlotterDriver {
         })
         .catch(() => {
           if (this.isClosed) return;
+          // with a hardware handshake the check may wait behind data held back in the serial port
+          if (this.sent - this.acked > BUFFER_BYTES) return;
           this.missedPolls += 1;
           if (this.missedPolls < 3) return;
           if (this.plotting) this.setAttention("The plotter is not answering: is it on?");
@@ -258,11 +265,16 @@ export class HpglPlotter implements PlotterDriver {
     for (const w of waiters) w();
   }
 
-  private async room(bytes: number): Promise<void> {
-    while (!this.cancelled && this.sent + bytes - this.acked > this.window) {
+  /** Whether what was started in `generation` should stop. */
+  private stale(generation: number): boolean {
+    return this.isClosed || generation !== this.generation;
+  }
+
+  private async room(bytes: number, generation: number): Promise<void> {
+    while (!this.stale(generation) && this.sent + bytes - this.acked > this.window) {
       await new Promise<void>((resolve) => this.waiters.push(resolve));
     }
-    if (this.cancelled) throw this.stopped();
+    if (this.stale(generation)) throw this.stopped();
   }
 
   private stopped(): Error {
@@ -276,16 +288,18 @@ export class HpglPlotter implements PlotterDriver {
    */
   private async send(instructions: string, reached: number | null, actual = false): Promise<void> {
     const text = `${instructions}${actual ? "OA;" : "OC;"}`;
-    await this.room(text.length);
+    const generation = this.plotGeneration;
+    await this.room(text.length, generation);
     this.sent += text.length;
     const end = this.sent;
     const p: Pending = {
       immediate: false,
       matches: POSITION,
       resolve: () => {
+        if (this.stale(generation)) return;
         this.acked = Math.max(this.acked, end);
         this.wake();
-        if (reached !== null && !this.cancelled) this.onReached(reached);
+        if (reached !== null) this.onReached(reached);
       },
       reject: () => {},
       timer: null,
@@ -295,26 +309,30 @@ export class HpglPlotter implements PlotterDriver {
   }
 
   private async drained(): Promise<void> {
-    while (!this.cancelled && this.acked < this.sent) {
+    const generation = this.plotGeneration;
+    while (!this.stale(generation) && this.acked < this.sent) {
       await new Promise<void>((resolve) => this.waiters.push(resolve));
     }
-    if (this.cancelled) throw this.stopped();
+    if (this.stale(generation)) throw this.stopped();
   }
 
   // ----- PlotterDriver
 
   public async prePlot(_plan: Plan, job: PlotJobInfo): Promise<void> {
-    this.cancelled = false;
+    this.generation += 1;
+    this.plotGeneration = this.generation;
+    this.cancelling = false;
+    this.plotting = true; // from here on a cancel applies
     this.sent = this.acked = 0;
     this.pending = this.pending.filter((p) => p.immediate);
     await this.write(`${ESC}.K`);
     const frame = await this.readPaper(); // the SIZE key may have been pressed since
+    if (this.stale(this.plotGeneration)) throw this.stopped();
     this.encoder = new HpglEncoder({
       transform: plotterTransform(job.paperSize ?? frame.paper.size, frame),
       clip: frame.clip,
     });
     this.pen = Math.min(6, Math.max(1, Math.round(job.pen ?? 1)));
-    this.plotting = true;
     await this.send(`SP${this.pen};${velocityInstruction(job.penSpeed ?? 381)}`, null);
   }
 
@@ -350,24 +368,27 @@ export class HpglPlotter implements PlotterDriver {
   }
 
   public cancel(): void {
-    if (!this.plotting) return;
-    this.cancelled = true;
+    // once per plot: a second ESC . K would discard what postCancel sends to put the pen away
+    if (!this.plotting || this.cancelling) return;
+    this.cancelling = true;
+    this.generation += 1; // what this plot still has on its way stops
     this.pending = this.pending.filter((p) => p.immediate); // ESC . K discards what they answer
-    this.acked = this.sent;
     this.wake();
     void this.write(`${ESC}.K`).catch(() => {});
   }
 
   public async postCancel(_plan: Plan): Promise<void> {
-    await sleep(300); // answers already on their way are ignored
     this.pending = this.pending.filter((p) => p.immediate);
-    this.cancelled = false;
     this.sent = this.acked = 0;
+    // Answers to instructions that ran before ESC . K got there may still come in. OI's answer looks like none of
+    // them, and comes once the plotter is past ESC . K: after it, the only position answer is the one to OA here.
+    await this.request("OI;", { matches: TEXT, timeoutMs: 30000 });
     await this.request("PU;SP0;OA;", { matches: POSITION, timeoutMs: 30000 });
   }
 
   public async postPlot(): Promise<void> {
     this.plotting = false;
+    this.cancelling = false;
     this.encoder = null;
   }
 

@@ -162,8 +162,8 @@ export class Plotter {
   public driver: PlotterDriver | null = null;
   /** The port this plotter is connected to, or trying. */
   public activePath: string | null = null;
-  /** Port and hardware given on the command line, which win over the configuration until it is edited. */
-  public override: { port?: string; hardware?: Hardware } = {};
+  /** The port given on the command line (`--device`), which wins over the configuration until its connection is edited. */
+  public override: { port?: string } = {};
 
   private error: string | null = null;
   private plotting = false;
@@ -191,7 +191,7 @@ export class Plotter {
   }
 
   public get hardware(): Hardware {
-    return this.override.hardware ?? this.config.hardware;
+    return this.config.hardware;
   }
 
   public get isPlotting(): boolean {
@@ -289,7 +289,6 @@ export class Plotter {
       this.override = {};
       this.interrupt();
     } else if (before.hardware !== config.hardware) {
-      this.override = {};
       if (this.driver instanceof EbbDriver) this.driver.ebb.changeHardware(config.hardware);
       this.emit({ c: "dev", p: this.deviceInfo() });
     }
@@ -370,15 +369,16 @@ export class Plotter {
     if (path === SIMULATED_PORT) {
       return HpglPlotter.connect(createSimulatedHpgl({ timeScale: simulationTimeScale() }), path);
     }
-    const { baudRate, rtscts } = this.config;
+    const detectingFor = this.config;
+    const { baudRate, rtscts } = detectingFor;
     const rates = baudRate > 0 ? [baudRate] : HPGL_BAUD_RATES;
     for (const rate of rates) {
       const port = await openSerial(path, rate, rtscts);
       try {
         const plotter = await HpglPlotter.connect(port, path, { rtscts, timeoutMs: rates.length > 1 ? 1500 : 3000 });
         console.log(`${this.config.name}: ${plotter.model} at ${path}, ${rate} baud`);
-        if (baudRate <= 0) {
-          // remember what worked
+        if (baudRate <= 0 && this.config === detectingFor) {
+          // remember what worked (unless the settings were changed meanwhile: then this connection is dropped)
           this.config = { ...this.config, baudRate: rate };
           this.deps.save();
         }
@@ -455,11 +455,13 @@ export class Plotter {
   }
 
   public cancel(): void {
+    // Only the first cancel of a plot reaches the driver: another one would also drop what the driver sends to
+    // clean up after the first (raising the pen, putting it away).
     if (this.controller) {
       this.controller.abort();
       this.controller = null;
+      this.driver?.cancel();
     }
-    this.driver?.cancel();
     if (this.unpaused) {
       this.signalUnpause?.();
       this.emit({ c: "pause", p: { paused: false } });
@@ -485,6 +487,7 @@ export class Plotter {
     }
 
     const abortPromise = onceAbort(signal);
+    abortPromise.catch(() => {}); // a cancel before the first race (e.g. during the blank-page capture) is handled below
     this.unpaused = null;
     this.signalUnpause = null;
     this.motionIdx = 0;
@@ -508,6 +511,7 @@ export class Plotter {
     await recorder?.plotStarted(plan.duration(), context); // captures the blank page before anything moves
     let penIsUp = true;
     try {
+      signal.throwIfAborted(); // cancelled during the blank-page capture: don't start the plotter at all
       await Promise.race([driver.prePlot(plan, job), abortPromise]);
       recorder?.plotterBusy(driver.startDelayMs, this.id); // tells the timelapse when the first motion really starts
       if (driver.reportsProgress) reach(0);

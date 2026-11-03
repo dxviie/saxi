@@ -116,9 +116,16 @@ export async function startServer(
       } catch {
         return;
       }
-      const target = plotters.get(String(msg.p?.plotter ?? client.plotter)) ?? plotters.default();
-      const run = (action: Promise<unknown>) => {
-        action.catch((e) => console.error(`${target.config.name}: ${(e as Error).message}`));
+      // a command for a plotter that is gone (e.g. just removed) is dropped, not sent to another plotter;
+      // older clients name none and drive the first plotter
+      const named = msg.p?.plotter;
+      const target =
+        named !== undefined && named !== null
+          ? plotters.get(String(named))
+          : (plotters.get(client.plotter) ?? plotters.default());
+      const run = (action: (plotter: Plotter) => Promise<unknown>) => {
+        if (!target) return;
+        action(target).catch((e) => console.error(`${target.config.name}: ${(e as Error).message}`));
       };
       switch (msg.c) {
         case "ping":
@@ -134,20 +141,16 @@ export async function startServer(
           break;
         }
         case "limp":
-          run(target.limp());
+          run((p) => p.limp());
           break;
         case "setPenHeight":
-          run(target.setPenHeight(Number(msg.p?.height), Number(msg.p?.rate)));
+          run((p) => p.setPenHeight(Number(msg.p?.height), Number(msg.p?.rate)));
           break;
         case "selectPen":
-          run(target.selectPen(Number(msg.p?.pen)));
+          run((p) => p.selectPen(Number(msg.p?.pen)));
           break;
         case "changeHardware":
-          try {
-            plotters.update(target.id, { hardware: msg.p?.hardware });
-          } catch (e) {
-            console.error((e as Error).message);
-          }
+          run(async (p) => plotters.update(p.id, { hardware: msg.p?.hardware }));
           break;
       }
     });

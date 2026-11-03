@@ -1346,6 +1346,8 @@ function useMachineSettings(plotter: PlotterWithStatus | null, state: State, onS
   }, [state.planOptions, state.pen, plotter?.kind]);
   // what the settings were when the view opened, or when they were last saved
   const baseline = useRef<string | null>(null);
+  // a change not saved yet, saved right away if the view closes (e.g. switching plotters) before the timer fires
+  const unsaved = useRef<(() => void) | null>(null);
   const id = plotter?.id ?? null;
   useEffect(() => {
     if (!id) return;
@@ -1354,8 +1356,12 @@ function useMachineSettings(plotter: PlotterWithStatus | null, state: State, onS
       baseline.current = json;
       return;
     }
-    if (json === baseline.current) return;
-    const timer = window.setTimeout(() => {
+    if (json === baseline.current) {
+      unsaved.current = null; // changed back
+      return;
+    }
+    const save = () => {
+      unsaved.current = null;
       fetch(`/plotters/${encodeURIComponent(id)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -1367,9 +1373,12 @@ function useMachineSettings(plotter: PlotterWithStatus | null, state: State, onS
           onSaved();
         })
         .catch(() => {});
-    }, 800);
+    };
+    unsaved.current = save;
+    const timer = window.setTimeout(save, 800);
     return () => window.clearTimeout(timer);
   }, [id, settings, onSaved]);
+  useEffect(() => () => unsaved.current?.(), []);
 }
 
 function PlotView({

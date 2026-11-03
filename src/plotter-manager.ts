@@ -179,8 +179,9 @@ export class PlotterManager {
     } else if (opts.defaultPort) {
       const first = [...this.plotters.values()].find((p) => p.config.kind === "ebb");
       if (first) {
+        // the model stays as configured: --hardware always has a value, given or not
         console.log(`${first.config.name}: using --device ${opts.defaultPort}`);
-        first.override = { port: opts.defaultPort, hardware: opts.defaultHardware };
+        first.override = { port: opts.defaultPort };
       }
     }
   }
@@ -223,7 +224,10 @@ export class PlotterManager {
   private checkPort(config: PlotterConfig): void {
     if (!config.port || config.port === SIMULATED_PORT) return;
     const mine = realpath(config.port);
-    const other = this.all().find((p) => p.id !== config.id && p.port && realpath(p.port) === mine);
+    const other = this.all().find(
+      (p) =>
+        p.id !== config.id && [p.port, p.activePath].some((q) => q && q !== SIMULATED_PORT && realpath(q) === mine),
+    );
     if (other) bad(`${other.config.name} already uses ${config.port}`);
   }
 
@@ -249,7 +253,6 @@ export class PlotterManager {
     const config = validatePlotterConfig(
       {
         ...plotter.config,
-        hardware: plotter.hardware,
         ...patch,
         settings: patch.settings ? { ...plotter.config.settings, ...patch.settings } : plotter.config.settings,
       },
@@ -300,6 +303,8 @@ export class PlotterManager {
     );
     const wanted = plotter.config.serialNumber;
     const found = ports.find((p) => !taken.has(realpath(p.path)) && (!wanted || p.serialNumber === wanted));
+    // claim it before any other plotter looking at the same time gets to choose
+    if (found) plotter.activePath = found.path;
     return found?.path ?? null;
   }
 
