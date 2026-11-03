@@ -189,6 +189,9 @@ describe("several plotters", () => {
       .expect(200);
     await waitFor(async () => messages.slice(before).some((m) => m.c === "finished"));
     const later = messages.slice(before);
+    // the plan arrives as plain arrays, which survive JSON
+    const planMessage = later.find((m) => m.c === "plan") as { p: { motions: Array<{ cols?: number[] }> } };
+    expect(planMessage.p.motions.find((m) => m.cols)?.cols?.length).toBeGreaterThan(0);
     expect(later.some((m) => m.c === "progress")).toBe(true);
     expect(later.every((m) => m.plotter === hpId)).toBe(true); // nothing about the AxiDraw
     ws.close();

@@ -97,6 +97,12 @@ export function frameFromClip(clip: Rect): HpglFrame {
   };
 }
 
+/** The 7475A frame for a paper name the plotter reported (`A4`, `A3`, `A`, `B`), if it is one. */
+export function frameForName(name: string): HpglFrame | null {
+  const known = HP7475A_FRAMES.find((f) => f.paper.name === name);
+  return known ? toFrame(known) : null;
+}
+
 /**
  * The 7475A paper frame to use for a drawing laid out on `paperSize` (mm), when the plotter can't be asked: the
  * same size if there is one, otherwise the smallest that fits it.

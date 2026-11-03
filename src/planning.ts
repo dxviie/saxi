@@ -41,7 +41,7 @@ export interface PlanOptions {
  * What a plan is made for: an EBB-driven machine (AxiDraw, NextDraw, …), or an HP-GL plotter that does its own
  * motion control, for which the plan only orders the paths and estimates the timing.
  */
-export type PlanHardware = Hardware | "idraw-h-se" | "hp7475a";
+export type PlanHardware = Hardware | "hp7475a";
 
 export const defaultPlanOptions: PlanOptions = {
   penUpHeight: 50,

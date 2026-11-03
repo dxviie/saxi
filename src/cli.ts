@@ -35,7 +35,7 @@ export function cli(argv: string[]): void {
     })
     .option("device", {
       alias: "d",
-      describe: "device to connect to",
+      describe: "device to connect to (the server: port of the first AxiDraw)",
       type: "string",
     })
     .command(
@@ -249,6 +249,41 @@ export function cli(argv: string[]): void {
       },
     )
     .command(
+      "nickname <name>",
+      "give the AxiDraw's board a nickname, to tell several AxiDraws apart (EBB firmware 2.5.5 or newer)",
+      (yargs) =>
+        yargs
+          .positional("name", {
+            type: "string",
+            description: "up to 16 letters, digits, '-' or '_'",
+            demandOption: true,
+          })
+          .check((args) => {
+            if (!/^[A-Za-z0-9_-]{1,16}$/.test(args.name)) {
+              throw new Error("The nickname should be 1 to 16 letters, digits, '-' or '_'");
+            }
+            return true;
+          }),
+      async (args) => {
+        console.log("connecting to plotter...");
+        const ebb = await connectEBB(args.hardware, args.device);
+        if (!ebb) {
+          console.error("Couldn't connect to device!");
+          process.exit(1);
+        }
+        if (ebb.firmwareVersionCompare(2, 5, 5) < 0) {
+          console.error(`Nicknames need EBB firmware 2.5.5 or newer; this board has ${ebb.firmwareVersion.join(".")}.`);
+          await ebb.close();
+          process.exit(1);
+        }
+        await ebb.command(`ST,${args.name}`);
+        console.log(
+          `Nickname set to "${args.name}". Unplug the AxiDraw's USB cable and plug it back in: it then reports the nickname as its serial number.`,
+        );
+        await ebb.close();
+      },
+    )
+    .command(
       "$0",
       "run the saxi web server",
       (args) =>
@@ -269,7 +304,7 @@ export function cli(argv: string[]): void {
             default: "200mb",
           })
           .option("data-dir", {
-            describe: "directory for camera settings and timelapse recordings",
+            describe: "directory for plotter and camera settings and timelapse recordings",
             default: defaultDataDir(),
             type: "string",
           }),

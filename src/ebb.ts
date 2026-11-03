@@ -32,7 +32,10 @@ type EBBCommand =
   | `S2,${number},${number},${number},${number}` // with rate and delay
   | `S2,0,${number}` // disable servo output
   | `SR,${number}` // servo power timeout
-  | `SR,${number},${PowerState}`; // servo power timeout with immediate state
+  | `SR,${number},${PowerState}` // servo power timeout with immediate state
+
+  // Nickname
+  | `ST,${string}`; // set nickname tag (fw >= 2.5.5), reported as the USB serial number after a reset
 
 type EBBQuery =
   // queries that return a single line
@@ -52,7 +55,8 @@ function modf(d: number): [number, number] {
   return [fracPart, intPart];
 }
 
-export type Hardware = "v3" | "brushless" | "nextdraw-2234";
+/** EBB-driven machines. iDraw H SE drives its servo like the brushless AxiDraw (output 5). */
+export type Hardware = "v3" | "brushless" | "nextdraw-2234" | "idraw-h-se";
 
 /**
  * The minimal serial transport the EBB needs: a byte stream in each direction

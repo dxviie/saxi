@@ -1,7 +1,8 @@
 /**
  * The "camera" tab: live multi-camera view, camera and timelapse settings,
  * recording controls and the timelapse library. Talks to the REST API in
- * camera-routes.ts; it does not touch the plotter state at all.
+ * camera-routes.ts; it does not touch the plotter state at all (it only lists
+ * the plotters, to assign cameras to them).
  */
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
@@ -21,8 +22,9 @@ import {
   defaultCameraConfig,
   sortResolutions,
 } from "./camera-types.js";
+import type { PlotterWithStatus } from "./plotter-types.js";
 
-export type View = "plot" | "camera";
+export type View = "plot" | "plotters" | "camera";
 
 export function ViewTabs({ view, setView }: { view: View; setView: (v: View) => void }) {
   const tab = (id: View, label: string) => (
@@ -39,6 +41,7 @@ export function ViewTabs({ view, setView }: { view: View; setView: (v: View) => 
   return (
     <div className="view-tabs" role="tablist">
       {tab("plot", "plot")}
+      {tab("plotters", "plotters")}
       {tab("camera", "camera")}
     </div>
   );
@@ -47,7 +50,7 @@ export function ViewTabs({ view, setView }: { view: View; setView: (v: View) => 
 // ---------------------------------------------------------------------------
 // API helpers
 
-async function api<T>(method: string, url: string, body?: unknown): Promise<T> {
+export async function api<T>(method: string, url: string, body?: unknown): Promise<T> {
   const res = await fetch(url, {
     method,
     headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
@@ -69,7 +72,7 @@ async function api<T>(method: string, url: string, body?: unknown): Promise<T> {
 }
 
 /** Calls `fn` immediately and then every `intervalMs` while mounted. */
-function usePolling(fn: () => Promise<void>, intervalMs: number) {
+export function usePolling(fn: () => Promise<void>, intervalMs: number) {
   useEffect(() => {
     let cancelled = false;
     let timer: number | undefined;
@@ -98,7 +101,7 @@ function formatDate(iso: string): string {
   return new Date(iso).toLocaleString();
 }
 
-function formatElapsed(fromIso: string, toIso: string | null): string {
+export function formatElapsed(fromIso: string, toIso: string | null): string {
   const seconds = Math.max(0, (new Date(toIso ?? Date.now()).getTime() - new Date(fromIso).getTime()) / 1000);
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -154,7 +157,7 @@ async function downloadStill(camera: CameraWithStatus): Promise<void> {
  * onto a canvas. The next request is only sent after the previous frame
  * arrived, so slow networks degrade gracefully instead of piling up.
  */
-function LiveImage({ camera, fps }: { camera: CameraWithStatus; fps: number }) {
+export function LiveImage({ camera, fps }: { camera: CameraWithStatus; fps: number }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [waiting, setWaiting] = useState(true);
@@ -204,10 +207,28 @@ function LiveImage({ camera, fps }: { camera: CameraWithStatus; fps: number }) {
   );
 }
 
-function CameraCard({ camera, fps, onEdit }: { camera: CameraWithStatus; fps: number; onEdit: () => void }) {
+/** Names of the plotters a camera records, or null when it records them all. */
+function recordsLabel(camera: CameraConfig, plotters: PlotterWithStatus[]): string | null {
+  if (plotters.length < 2 || camera.plotters.length === 0) return null;
+  const names = plotters.filter((p) => camera.plotters.includes(p.id)).map((p) => p.name);
+  return names.length ? `records ${names.join(", ")}` : null;
+}
+
+function CameraCard({
+  camera,
+  fps,
+  onEdit,
+  plotters,
+}: {
+  camera: CameraWithStatus;
+  fps: number;
+  onEdit: () => void;
+  plotters: PlotterWithStatus[];
+}) {
   const { status } = camera;
   const [stillError, setStillError] = useState<string | null>(null);
   const detail = [
+    recordsLabel(camera, plotters),
     camera.kind,
     status.width && status.height ? `${status.width}×${status.height}` : null,
     `${camera.fps} fps`,
@@ -496,11 +517,13 @@ function DeviceFields({ draft, set, cameraId }: { draft: CameraDraft; set: SetDr
 
 function CameraForm({
   initial,
+  plotters,
   onSave,
   onDelete,
   onCancel,
 }: {
   initial: CameraConfig | null;
+  plotters: PlotterWithStatus[];
   onSave: (config: Omit<CameraConfig, "id">) => Promise<void>;
   onDelete: (() => Promise<void>) | null;
   onCancel: () => void;
@@ -616,6 +639,29 @@ function CameraForm({
         </select>
       </label>
       {form.trigger === "penDown" && <div className="camera-form__help">{PEN_DOWN_HELP}</div>}
+      {plotters.length > 1 && (
+        <fieldset className="camera-form__plotters">
+          <legend>records</legend>
+          {plotters.map((p) => (
+            <label key={p.id} className="flex-checkbox">
+              <input
+                type="checkbox"
+                checked={form.plotters.length === 0 || form.plotters.includes(p.id)}
+                onChange={(e) => {
+                  const current = form.plotters.length === 0 ? plotters.map((q) => q.id) : form.plotters;
+                  const next = e.target.checked ? [...current, p.id] : current.filter((id) => id !== p.id);
+                  // all of them is stored as none, so plotters added later are recorded too
+                  set({ plotters: next.length === plotters.length ? [] : next });
+                }}
+              />
+              {p.name}
+            </label>
+          ))}
+          <div className="camera-form__help">
+            Which plotters this camera films: it records their plots, and their manual recordings.
+          </div>
+        </fieldset>
+      )}
       <label className="flex-checkbox">
         <input type="checkbox" checked={form.enabled} onChange={(e) => set({ enabled: e.target.checked })} />
         enabled
@@ -924,6 +970,7 @@ function TimelapseCard({
             )
             .join(", ")}{" "}
           · {session.source === "plot" ? `plot, ${TRIGGER_LABELS[session.trigger]}` : "manual"}
+          {session.plotterName ? ` · ${session.plotterName}` : ""}
         </div>
         {session.renders.length > 0 && (
           <ul className="timelapse-card__renders">
@@ -1014,6 +1061,9 @@ export function CameraView({ tabs, title }: { tabs: React.ReactNode; title: Reac
   const [cameras, setCameras] = useState<CameraWithStatus[]>([]);
   const [status, setStatus] = useState<TimelapseStatusResponse | null>(null);
   const [sessions, setSessions] = useState<TimelapseSession[]>([]);
+  const [plotters, setPlotters] = useState<PlotterWithStatus[]>([]);
+  const [recordPlotter, setRecordPlotter] = useState("");
+  const [libraryPlotter, setLibraryPlotter] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<CameraConfig | "new" | null>(null);
   const [recordingName, setRecordingName] = useState("");
@@ -1024,14 +1074,16 @@ export function CameraView({ tabs, title }: { tabs: React.ReactNode; title: Reac
 
   const refresh = useCallback(async () => {
     try {
-      const [c, s, t] = await Promise.all([
+      const [c, s, t, p] = await Promise.all([
         api<{ cameras: CameraWithStatus[] }>("GET", "/cameras"),
         api<TimelapseStatusResponse>("GET", "/timelapse/status"),
         api<{ timelapses: TimelapseSession[] }>("GET", "/timelapses"),
+        api<{ plotters: PlotterWithStatus[] }>("GET", "/plotters").catch(() => ({ plotters: [] })),
       ]);
       setCameras(c.cameras);
       setStatus(s);
       setSessions(t.timelapses);
+      setPlotters(p.plotters);
       setError(null);
     } catch (e) {
       setError(`Cannot reach the saxi server: ${(e as Error).message}`);
@@ -1056,8 +1108,18 @@ export function CameraView({ tabs, title }: { tabs: React.ReactNode; title: Reac
   };
 
   const ffmpeg = status?.capabilities.ffmpeg ?? false;
-  const active = status?.active ?? null;
-  const enabledCameras = cameras.filter((c) => c.enabled);
+  const actives = status?.actives ?? (status?.active ? [status.active] : []);
+  // by default the first plotter that has a camera
+  const recordFor =
+    plotters.find((p) => p.id === recordPlotter) ??
+    plotters.find((p) => cameras.some((c) => c.enabled && (c.plotters.length === 0 || c.plotters.includes(p.id)))) ??
+    plotters[0];
+  const enabledCameras = cameras.filter(
+    (c) => c.enabled && (!recordFor || c.plotters.length === 0 || c.plotters.includes(recordFor.id)),
+  );
+  const recordingFor = recordFor ? actives.find((a) => a.plotterId === recordFor.id) : actives[0];
+  const plotterName = (id: string | null | undefined) => plotters.find((p) => p.id === id)?.name ?? "";
+  const shownSessions = libraryPlotter ? sessions.filter((t) => t.plotterId === libraryPlotter) : sessions;
   const jobsFor = (id: string) => (status?.renderJobs ?? []).filter((j) => j.sessionId === id);
 
   return (
@@ -1094,6 +1156,7 @@ export function CameraView({ tabs, title }: { tabs: React.ReactNode; title: Reac
           {editing !== null && (
             <CameraForm
               initial={editing === "new" ? null : editing}
+              plotters={plotters}
               onSave={async (config) => {
                 if (editing === "new") await api("POST", "/cameras", config);
                 else await api("PUT", `/cameras/${editing.id}`, config);
@@ -1130,27 +1193,52 @@ export function CameraView({ tabs, title }: { tabs: React.ReactNode; title: Reac
         <div className="control-panel-bottom">
           <div className="section-header">recording</div>
           <div className="section-body">
-            {active ? (
-              <>
+            {actives.map((active) => (
+              <div key={active.id}>
                 <div className="recording-status">
                   <span className="status-dot status-dot--recording" />
                   <strong>{active.name}</strong>
                   <div className="camera-hint">
+                    {plotters.length > 1 && active.plotterId ? `${plotterName(active.plotterId)} · ` : ""}
                     {active.frameCount} frames · {formatElapsed(active.startedAt, null)}
-                    {status?.plotting ? " · plotting" : ""}
+                    {active.plotterId && status?.plottingPlotters?.includes(active.plotterId) ? " · plotting" : ""}
                   </div>
                 </div>
                 <div className="flex">
-                  <button type="button" onClick={() => act(() => api("POST", "/timelapse/snap"))}>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      act(() => api("POST", "/timelapse/snap", { plotter: active.plotterId ?? undefined }))
+                    }
+                  >
                     snapshot
                   </button>
-                  <button type="button" className="danger" onClick={() => act(() => api("POST", "/timelapse/stop"))}>
+                  <button
+                    type="button"
+                    className="danger"
+                    onClick={() =>
+                      act(() => api("POST", "/timelapse/stop", { plotter: active.plotterId ?? undefined }))
+                    }
+                  >
                     stop
                   </button>
                 </div>
-              </>
-            ) : (
+              </div>
+            ))}
+            {!recordingFor && (
               <>
+                {plotters.length > 1 && (
+                  <label>
+                    record
+                    <select value={recordFor?.id ?? ""} onChange={(e) => setRecordPlotter(e.target.value)}>
+                      {plotters.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
                 <input
                   type="text"
                   placeholder="recording name (optional)"
@@ -1164,11 +1252,11 @@ export function CameraView({ tabs, title }: { tabs: React.ReactNode; title: Reac
                   title={
                     enabledCameras.length === 0
                       ? "Add and enable a camera first"
-                      : "Start recording with all enabled cameras"
+                      : `Start recording with ${enabledCameras.map((c) => c.name).join(", ")}`
                   }
                   onClick={() =>
                     act(async () => {
-                      await api("POST", "/timelapse/start", { name: recordingName });
+                      await api("POST", "/timelapse/start", { name: recordingName, plotter: recordFor?.id });
                       setRecordingName("");
                     })
                   }
@@ -1176,6 +1264,9 @@ export function CameraView({ tabs, title }: { tabs: React.ReactNode; title: Reac
                   start recording
                 </button>
                 <div className="camera-hint">
+                  {enabledCameras.length === 0 && cameras.length > 0 && recordFor && plotters.length > 1
+                    ? `No enabled camera records ${recordFor.name}: pick it under “records” in a camera's settings. `
+                    : ""}
                   {status?.settings.enabled
                     ? "Plots are recorded automatically."
                     : "Plots are not recorded automatically."}
@@ -1226,21 +1317,40 @@ export function CameraView({ tabs, title }: { tabs: React.ReactNode; title: Reac
         ) : (
           <div className={`camera-grid camera-grid--${Math.min(cameras.length, 4)}`}>
             {cameras.map((camera) => (
-              <CameraCard key={camera.id} camera={camera} fps={previewFps} onEdit={() => setEditing(camera)} />
+              <CameraCard
+                key={camera.id}
+                camera={camera}
+                fps={previewFps}
+                plotters={plotters}
+                onEdit={() => setEditing(camera)}
+              />
             ))}
           </div>
         )}
         <div className="camera-main__header">
           <h2>timelapses</h2>
+          {plotters.length > 1 && (
+            <label className="inline">
+              plotter
+              <select value={libraryPlotter} onChange={(e) => setLibraryPlotter(e.target.value)}>
+                <option value="">all</option>
+                {plotters.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           {status && <span className="camera-hint">stored in {status.dataDir}</span>}
         </div>
-        {sessions.length === 0 ? (
+        {shownSessions.length === 0 ? (
           <div className="camera-empty">
             <p>No timelapses yet. Start a recording, or enable “record every plot” and plot something.</p>
           </div>
         ) : (
           <div className="timelapse-list">
-            {sessions.map((session) => (
+            {shownSessions.map((session) => (
               <TimelapseCard
                 key={session.id}
                 session={session}
@@ -1258,9 +1368,9 @@ export function CameraView({ tabs, title }: { tabs: React.ReactNode; title: Reac
                   await refresh();
                 }}
                 onStop={
-                  active?.id === session.id
+                  actives.some((a) => a.id === session.id)
                     ? async () => {
-                        await api("POST", "/timelapse/stop");
+                        await api("POST", "/timelapse/stop", { plotter: session.plotterId ?? undefined });
                         await refresh();
                       }
                     : null

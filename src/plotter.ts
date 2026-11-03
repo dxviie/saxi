@@ -248,7 +248,8 @@ export class Plotter {
     ];
     if (this.motionIdx !== null) messages.push({ c: "progress", p: { motionIdx: this.motionIdx } });
     if (this.currentPlan !== null) {
-      messages.push({ c: "plan", p: { motions: this.currentPlan.toTransferable(), job: this.job } });
+      // serialized: typed arrays don't survive JSON (old UIs read this too, with fromTransferable)
+      messages.push({ c: "plan", p: { motions: this.currentPlan.serialize(), job: this.job } });
     }
     return messages;
   }
@@ -354,7 +355,10 @@ export class Plotter {
   private async open(path: string): Promise<PlotterDriver> {
     if (this.config.kind === "ebb") {
       console.log(`Found EBB at ${path}`);
-      const port = path === SIMULATED_PORT ? createSimulatedEbb() : await openSerial(path, 9600);
+      const port =
+        path === SIMULATED_PORT
+          ? createSimulatedEbb({ timeScale: simulationTimeScale() })
+          : await openSerial(path, 9600);
       try {
         const ebb = await EBB.create(port, this.hardware);
         return new EbbDriver(ebb, path, path === SIMULATED_PORT ? new Promise(() => {}) : disconnection(port));
@@ -486,7 +490,7 @@ export class Plotter {
     this.motionIdx = 0;
     this.currentPlan = plan;
     this.job = { ...job, startedAt: new Date().toISOString(), estimatedSeconds: plan.duration() };
-    this.emit({ c: "plan", p: { motions: plan.toTransferable(), job: this.job } });
+    this.emit({ c: "plan", p: { motions: plan.serialize(), job: this.job } });
 
     // Drivers that know when the plotter gets to each motion report it; the others are reported as sent.
     let reported = -1;

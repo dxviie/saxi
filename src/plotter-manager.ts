@@ -25,7 +25,7 @@ import {
   SIMULATED_PORT,
 } from "./plotter-types.js";
 
-const HARDWARE: Hardware[] = ["v3", "brushless", "nextdraw-2234"];
+const HARDWARE: Hardware[] = ["v3", "brushless", "nextdraw-2234", "idraw-h-se"];
 
 export class PlotterConfigError extends Error {}
 
@@ -305,7 +305,14 @@ export class PlotterManager {
 
   /** The serial ports of the server, for picking one in the plotter form. */
   public async ports(): Promise<SerialPortListing[]> {
-    const ports = await this.listPorts();
+    let ports: PortInfo[];
+    try {
+      ports = await this.listPorts();
+    } catch (e) {
+      // e.g. udevadm missing on Linux
+      console.warn(`Could not list the serial ports: ${(e as Error).message}`);
+      ports = [];
+    }
     const links = process.platform === "linux" ? serialLinks() : new Map();
     const configured = this.all().map((p) => ({
       id: p.id,
