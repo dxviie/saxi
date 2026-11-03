@@ -33,9 +33,15 @@ export interface PlanOptions {
   cropToMargins: boolean;
 
   minimumPathLength: number;
-  hardware: Hardware;
+  hardware: PlanHardware;
   penHome: Vec2;
 }
+
+/**
+ * What a plan is made for: an EBB-driven machine (AxiDraw, NextDraw, …), or an HP-GL plotter that does its own
+ * motion control, for which the plan only orders the paths and estimates the timing.
+ */
+export type PlanHardware = Hardware | "idraw-h-se" | "hp7475a";
 
 export const defaultPlanOptions: PlanOptions = {
   penUpHeight: 50,
@@ -99,6 +105,7 @@ export const Device = (hardware = "v3"): Device => {
   if (hardware === "brushless") return AxidrawBrushless;
   if (hardware === "nextdraw-2234") return NextDraw2234;
   if (hardware === "idraw-h-se") return Axidraw; // https://github.com/alexrudd2/saxi/issues/298
+  if (hardware === "hp7475a") return HP7475A;
   return Axidraw;
 };
 
@@ -109,6 +116,41 @@ export interface Device {
   penServoMin: number; // pen down
   penServoMax: number; // pen up
   penPctToPos: (pct: number) => number;
+  /** The pen is only ever up or down (HP-GL plotters): the pen heights don't apply. */
+  binaryPen?: boolean;
+  /**
+   * Motion settings the machine decides itself, which replace the plan options of the same name. They only feed
+   * the time estimate (and the timelapse timing) for plotters that plan their own motion.
+   */
+  fixedOptions?: Partial<
+    Pick<
+      PlanOptions,
+      | "penDownAcceleration"
+      | "penDownCorneringFactor"
+      | "penUpAcceleration"
+      | "penUpMaxVelocity"
+      | "penDropDuration"
+      | "penLiftDuration"
+    >
+  >;
+  /** The fastest the machine can draw, in mm/s. */
+  maxPenDownVelocity?: number;
+}
+
+/** Servo positions for the pen heights (in %), or 1 (up) and 0 (down) for a pen that is only up or down. */
+export function penPositions(device: Device, penUpHeight: number, penDownHeight: number): { up: number; down: number } {
+  if (device.binaryPen) return { up: 1, down: 0 };
+  return { up: device.penPctToPos(penUpHeight), down: device.penPctToPos(penDownHeight) };
+}
+
+/** Plan options with what the machine decides for itself filled in. */
+export function effectivePlanOptions(planOptions: PlanOptions): PlanOptions {
+  const device = Device(planOptions.hardware);
+  const options = { ...planOptions, ...device.fixedOptions };
+  if (device.maxPenDownVelocity) {
+    options.penDownMaxVelocity = Math.min(options.penDownMaxVelocity, device.maxPenDownVelocity);
+  }
+  return options;
 }
 
 // Defaults: penup at 12000 (1ms), pendown at 16000 (1.33ms).
@@ -148,6 +190,32 @@ const NextDraw2234: Device = {
     const t = pct / 100.0;
     return Math.round(this.penServoMin * t + this.penServoMax * (1 - t));
   },
+};
+
+/** One HP plotter unit is 0.02488 mm (HP 7475A Interfacing and Programming Manual, chapter 2). */
+export const HPGL_UNITS_PER_MM = 1 / 0.02488;
+
+/**
+ * HP 7475A: plans are in plotter units, so they map 1:1 onto HP-GL coordinates. The plotter plans its own motion
+ * at about 2 g and up to 38.1 cm/s; a velocity set with VS also drops the acceleration to 0.5 g.
+ */
+const HP7475A: Device = {
+  stepsPerMm: HPGL_UNITS_PER_MM,
+  penServoMin: 0, // pen down
+  penServoMax: 1, // pen up
+  penPctToPos(pct: number): number {
+    return pct <= 50 ? this.penServoMax : this.penServoMin;
+  },
+  binaryPen: true,
+  fixedOptions: {
+    penDownAcceleration: 4900,
+    penDownCorneringFactor: 0.05,
+    penUpAcceleration: 4900,
+    penUpMaxVelocity: 381,
+    penDropDuration: 0.05,
+    penLiftDuration: 0.05,
+  },
+  maxPenDownVelocity: 381,
 };
 
 export const AxidrawFast: ToolingProfile = {
