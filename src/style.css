@@ -77,6 +77,15 @@ path {
   width: 100%;
 }
 
+.preview-carousel rect {
+  fill: rgba(217, 119, 6, 0.2);
+}
+
+.preview-carousel text {
+  fill: rgb(146, 64, 14);
+  font-weight: 700;
+}
+
 .preview > svg {
   display: block;
   contain: strict;

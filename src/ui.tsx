@@ -30,6 +30,7 @@ import {
 import useComponentSize from "./useComponentSize.js";
 
 import { formatDuration } from "./util.js";
+import type { Vec2 } from "./vec.js";
 
 import "./style.css";
 import { CameraView, type View, ViewTabs } from "./camera-ui.js";
@@ -120,9 +121,10 @@ function initialStateFor(plotter: PlotterWithStatus | null): State {
     }
   }
   planOptions.paperSize = new PaperSize(planOptions.paperSize.size);
-  // sets don't survive JSON: the layers are chosen again when a drawing loads
-  planOptions.selectedGroupLayers = new Set(planOptions.selectedGroupLayers ?? []);
-  planOptions.selectedStrokeLayers = new Set(planOptions.selectedStrokeLayers ?? []);
+  // sets don't survive JSON (older versions saved them as {}): the layers are chosen again when a drawing loads
+  const savedLayers = (layers: unknown) => new Set<string>(Array.isArray(layers) ? layers : []);
+  planOptions.selectedGroupLayers = savedLayers(persisted.selectedGroupLayers);
+  planOptions.selectedStrokeLayers = savedLayers(persisted.selectedStrokeLayers);
   const drawing = drawings.get(key);
   return {
     ...baseState,
@@ -713,6 +715,30 @@ function TimeLeft({
   );
 }
 
+/** Marks the side of the paper at the plotter's pen carousel: its left, which is the top of a portrait drawing. */
+function CarouselMarker({ paperSize }: { paperSize: Vec2 }) {
+  const band = 8; // mm
+  const landscape = paperSize.x >= paperSize.y;
+  const x = landscape ? band / 2 : paperSize.x / 2;
+  const y = landscape ? paperSize.y / 2 : band / 2;
+  return (
+    <g className="preview-carousel">
+      <title>The plotter's pen carousel is on this side</title>
+      <rect width={landscape ? band : paperSize.x} height={landscape ? paperSize.y : band} />
+      <text
+        x={x}
+        y={y}
+        fontSize="4.5"
+        textAnchor="middle"
+        dominantBaseline="central"
+        transform={landscape ? `rotate(-90 ${x} ${y})` : undefined}
+      >
+        carousel
+      </text>
+    </g>
+  );
+}
+
 function PlanPreview({
   state,
   previewSize,
@@ -737,10 +763,14 @@ function PlanPreview({
         .filter((m) => m.length);
       return (
         <g transform={`scale(${1 / device.stepsPerMm})`}>
-          <title>Pen home</title>
-          <text x={lines[0][0].x} y={lines[0][0].y} fontSize="40" textAnchor="middle" dominantBaseline="middle">
-            ꚛ
-          </text>
+          {!device.binaryPen && (
+            <>
+              <title>Pen home</title>
+              <text x={lines[0][0].x} y={lines[0][0].y} fontSize="40" textAnchor="middle" dominantBaseline="middle">
+                ꚛ
+              </text>
+            </>
+          )}
           {lines.map((line, i) => (
             <path
               // biome-ignore lint/suspicious/noArrayIndexKey: the paths are not changed elsewhere
@@ -757,7 +787,7 @@ function PlanPreview({
       );
     }
     return null;
-  }, [plan, strokeWidth, colorPathsByStrokeOrder, device.stepsPerMm]);
+  }, [plan, strokeWidth, colorPathsByStrokeOrder, device.stepsPerMm, device.binaryPen]);
 
   // w/h of svg.
   // first try scaling so that h = area.h. if w < area.w, then ok.
@@ -843,6 +873,7 @@ function PlanPreview({
         <title>Plot preview</title>
         {memoizedPlanPreview}
         {margins}
+        {device.binaryPen && <CarouselMarker paperSize={ps.size} />}
       </svg>
       {progressIndicator}
     </div>
