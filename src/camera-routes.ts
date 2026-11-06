@@ -9,11 +9,11 @@
  *   GET    /cameras/:id/snapshot.jpg        latest frame (?fresh=1 waits for a new one)
  *   GET    /cameras/:id/stream.mjpeg        multipart MJPEG live stream
  *
- *   GET    /timelapse/status                settings, active recording, render jobs, capabilities
+ *   GET    /timelapse/status                settings, active recordings, render jobs, capabilities
  *   PUT    /timelapse/settings              update settings
- *   POST   /timelapse/start                 start a manual recording
- *   POST   /timelapse/snap                  capture a frame set into the active recording
- *   POST   /timelapse/stop                  stop the active recording
+ *   POST   /timelapse/start                 start a manual recording ({ name, plotter }: of the plotter's cameras)
+ *   POST   /timelapse/snap                  capture a frame set into the active recording ({ plotter })
+ *   POST   /timelapse/stop                  stop the active recording ({ plotter })
  *
  *   GET    /timelapses                      list recordings
  *   GET    /timelapses/:id                  one recording
@@ -57,12 +57,29 @@ function handler(fn: (req: Request, res: Response) => Promise<void> | void) {
   };
 }
 
+/** What the camera routes need to know about the plotters. */
+export interface PlotterLookup {
+  /** Ids of the plotters that are plotting. */
+  plotting(): string[];
+  /** The plotter a request that names none is about. */
+  defaultId(): string;
+  name(id: string): string | undefined;
+}
+
 export function mountCameraRoutes(
   app: Express,
   cameras: CameraManager,
   recorder: TimelapseRecorder,
-  isPlotting: () => boolean,
+  plotters: PlotterLookup,
 ): void {
+  /** The plotter a request names, or undefined. */
+  const plotterOf = (req: Request): string | undefined => {
+    const id = (req.body as { plotter?: unknown } | undefined)?.plotter;
+    if (typeof id !== "string" || !id) return undefined;
+    if (plotters.name(id) === undefined) throw new TimelapseError("no such plotter", 404);
+    return id;
+  };
+
   // ----- cameras
 
   app.get("/cameras", (_req, res) => {
@@ -156,13 +173,16 @@ export function mountCameraRoutes(
   app.get(
     "/timelapse/status",
     handler(async (_req, res) => {
+      const plotting = plotters.plotting();
       const body: TimelapseStatusResponse = {
         settings: recorder.settings,
         active: recorder.activeSession(),
+        actives: recorder.activeSessions(),
         renderJobs: recorder.renderJobs(),
         capabilities: await cameras.getCapabilities(),
         dataDir: recorder.dataDir,
-        plotting: isPlotting(),
+        plotting: plotting.length > 0,
+        plottingPlotters: plotting,
       };
       res.json(body);
     }),
@@ -179,21 +199,24 @@ export function mountCameraRoutes(
     "/timelapse/start",
     handler(async (req, res) => {
       const name = typeof req.body?.name === "string" ? req.body.name : undefined;
-      res.status(201).json(await recorder.start({ source: "manual", name }));
+      const plotterId = plotterOf(req) ?? plotters.defaultId();
+      res
+        .status(201)
+        .json(await recorder.start({ source: "manual", name, plotterId, plotterName: plotters.name(plotterId) }));
     }),
   );
 
   app.post(
     "/timelapse/snap",
-    handler(async (_req, res) => {
-      res.json({ frameCount: await recorder.snap() });
+    handler(async (req, res) => {
+      res.json({ frameCount: await recorder.snap(plotterOf(req)) });
     }),
   );
 
   app.post(
     "/timelapse/stop",
-    handler(async (_req, res) => {
-      res.json(await recorder.stop("finished"));
+    handler(async (req, res) => {
+      res.json(await recorder.stop("finished", plotterOf(req)));
     }),
   );
 

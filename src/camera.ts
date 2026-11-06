@@ -628,7 +628,22 @@ export function validateCameraConfig(input: unknown, id: string): CameraConfig {
   const trigger = (typeof o.trigger === "string" ? o.trigger : "") as TimelapseTrigger | "";
   if (trigger && !TIMELAPSE_TRIGGERS.includes(trigger)) bad(`trigger must be one of ${TIMELAPSE_TRIGGERS.join(", ")}`);
   const name = (typeof o.name === "string" ? o.name.trim() : "").slice(0, 60) || `Camera ${id.slice(0, 4)}`;
-  return { id, name, kind, source, resolution, inputFormat, fps, rotate, trigger, enabled: Boolean(o.enabled) };
+  const plotters = Array.isArray(o.plotters)
+    ? [...new Set(o.plotters.filter((p): p is string => typeof p === "string" && /^[A-Za-z0-9_-]{1,40}$/.test(p)))]
+    : [];
+  return {
+    id,
+    name,
+    kind,
+    source,
+    resolution,
+    inputFormat,
+    fps,
+    rotate,
+    trigger,
+    plotters,
+    enabled: Boolean(o.enabled),
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 import type { Path } from "flatten-svg";
 import { elideShorterThan, merge as joinNearbyPaths, reorder as sortPaths } from "optimize-paths";
-import { Device, type Plan, type PlanOptions, plan } from "./planning.js";
+import { Device, effectivePlanOptions, type Plan, type PlanOptions, penPositions, plan } from "./planning.js";
 import { cropToMargins, dedupPoints, scaleToPaper } from "./util.js";
 import { type Vec2, vmul, vrot } from "./vec.js";
 
@@ -16,8 +16,9 @@ const mmPerSvgUnit = mmPerInch / svgUnitsPerInch;
  * @param planOptions
  * @returns
  */
-export function replan(inPaths: Path[], planOptions: PlanOptions): Plan {
+export function replan(inPaths: Path[], requestedOptions: PlanOptions): Plan {
   let paths: Vec2[][] = inPaths.map((path) => path.points);
+  const planOptions = effectivePlanOptions(requestedOptions);
   const device = Device(planOptions.hardware);
 
   // Rotate drawing around center of paper to handle plotting portrait drawings
@@ -84,11 +85,12 @@ export function replan(inPaths: Path[], planOptions: PlanOptions): Plan {
 
   // And finally, motion planning.
   console.time("planning pen motions");
+  const pen = penPositions(device, planOptions.penUpHeight, planOptions.penDownHeight);
   const theplan = plan(
     paths,
     {
-      penUpPos: device.penPctToPos(planOptions.penUpHeight),
-      penDownPos: device.penPctToPos(planOptions.penDownHeight),
+      penUpPos: pen.up,
+      penDownPos: pen.down,
       penDownProfile: {
         acceleration: planOptions.penDownAcceleration * device.stepsPerMm,
         maximumVelocity: planOptions.penDownMaxVelocity * device.stepsPerMm,

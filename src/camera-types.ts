@@ -36,6 +36,8 @@ export interface CameraConfig {
   rotate: CameraRotation;
   /** What triggers this camera's timelapse frames. Empty follows the timelapse settings. */
   trigger: TimelapseTrigger | "";
+  /** Ids of the plotters this camera records. Empty records every plotter. */
+  plotters: string[];
   /** Disabled cameras are not previewed or recorded. */
   enabled: boolean;
 }
@@ -179,6 +181,9 @@ export interface TimelapseSession {
   finishedAt: string | null;
   status: TimelapseStatus;
   source: "plot" | "manual";
+  /** The plotter recorded. Missing in recordings from before saxi drove several plotters. */
+  plotterId?: string | null;
+  plotterName?: string | null;
   trigger: TimelapseTrigger;
   /** Number of moments at which frames were captured (by any camera). */
   frameCount: number;
@@ -208,11 +213,17 @@ export interface Capabilities {
 
 export interface TimelapseStatusResponse {
   settings: TimelapseSettings;
+  /** The first recording in progress (see `actives` for all of them). */
   active: TimelapseSession | null;
+  /** Every recording in progress, one per plotter at most. */
+  actives: TimelapseSession[];
   renderJobs: RenderJob[];
   capabilities: Capabilities;
   dataDir: string;
+  /** Whether any plotter is plotting. */
   plotting: boolean;
+  /** The plotters that are plotting. */
+  plottingPlotters: string[];
 }
 
 export const defaultRenderSettings: RenderSettings = {
@@ -244,5 +255,6 @@ export const defaultCameraConfig: Omit<CameraConfig, "id"> = {
   fps: 2,
   rotate: 0,
   trigger: "",
+  plotters: [],
   enabled: true,
 };

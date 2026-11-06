@@ -77,6 +77,15 @@ path {
   width: 100%;
 }
 
+.preview-carousel rect {
+  fill: rgba(217, 119, 6, 0.2);
+}
+
+.preview-carousel text {
+  fill: rgb(146, 64, 14);
+  font-weight: 700;
+}
+
 .preview > svg {
   display: block;
   contain: strict;
@@ -914,4 +923,123 @@ a.button-like:hover {
     flex-basis: auto;
     max-height: 200px;
   }
+}
+
+/* PLOTTERS (switcher, notices, overview) */
+
+.plotter-switcher {
+  margin: 0 1rem 0.25rem;
+}
+.plotter-switcher__select {
+  width: 100%;
+  margin: 0;
+}
+
+.plotter-notice {
+  margin: 0.25rem 1rem;
+  padding: 0.4rem 0.5rem;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--red);
+  border: 1px solid var(--red);
+  background-color: #fbe9e9;
+}
+.section-body .plotter-notice {
+  margin: 0.25rem 0;
+}
+
+.camera-form__plotters {
+  margin: 0 0 0.5rem;
+  padding: 0.25rem 0.5rem 0;
+  border: 1px solid var(--purple-light);
+}
+.camera-form__plotters legend {
+  padding: 0 0.25rem;
+  font-size: 12px;
+}
+.camera-form code {
+  font-family: monospace;
+}
+
+.plotter-row__open {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-align: left;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.plotter-grid {
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+}
+.plotter-grid.camera-grid--1 {
+  grid-template-columns: minmax(320px, 640px);
+}
+
+.plotter-card__media {
+  display: flex;
+  aspect-ratio: 16 / 9;
+  background-color: var(--purple-light);
+  overflow: hidden;
+}
+.plotter-card__drawing {
+  flex: 1 1 50%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.75rem;
+}
+.plotter-card__drawing img {
+  max-width: 100%;
+  max-height: 100%;
+  box-shadow: 1px 1px 6px rgba(0, 0, 0, 0.2);
+}
+.plotter-card__idle {
+  color: var(--purple);
+  font-weight: 700;
+}
+.plotter-card__camera {
+  flex: 1 1 50%;
+  min-width: 0;
+}
+.plotter-card__camera .camera-frame {
+  height: 100%;
+  aspect-ratio: auto;
+}
+.plotter-card__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plotter-card__attention {
+  margin: 0 0.75rem 0.5rem;
+  font-size: 12px;
+  color: var(--red);
+}
+.plotter-card__job {
+  padding: 0 0.75rem 0.75rem;
+  font-size: 12px;
+}
+.plotter-card__jobline {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.25rem 0.75rem;
+}
+.plotter-card__jobline strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plotter-card__progress {
+  display: block;
+  max-width: none;
+  margin: 0.4rem 0 0.5rem;
+}
+.plotter-card__controls {
+  justify-content: flex-start;
 }

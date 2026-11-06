@@ -18,15 +18,33 @@ import React, {
 } from "react";
 import { createRoot } from "react-dom/client";
 import { PaperSize } from "./paper-size.js";
-import { Device, defaultPlanOptions, Plan, type PlanOptions, type TransferredMotion, XYMotion } from "./planning.js";
+import {
+  Device,
+  defaultPlanOptions,
+  Plan,
+  type PlanOptions,
+  penPositions,
+  type TransferredMotion,
+  XYMotion,
+} from "./planning.js";
 import useComponentSize from "./useComponentSize.js";
 
 import { formatDuration } from "./util.js";
+import type { Vec2 } from "./vec.js";
 
 import "./style.css";
 import { CameraView, type View, ViewTabs } from "./camera-ui.js";
 import { type BaseDriver, type DeviceInfo, SaxiDriver, WebSerialDriver } from "./drivers.js";
 import type { Hardware } from "./ebb.js";
+import { frameForName, frameForPaper, HP7475A_FRAMES, hpglProgram, paperFits } from "./hpgl.js";
+import {
+  MACHINE_SETTING_KEYS,
+  type PlotJobInfo,
+  type PlotterSettings,
+  type PlotterWithStatus,
+  planHardwareFor,
+} from "./plotter-types.js";
+import { connectionLabel, PlottersView, PlotterSwitcher, usePlotters } from "./plotter-ui.js";
 import pathJoinRadiusIcon from "./icons/path-joining radius.svg";
 import pointJoinRadiusIcon from "./icons/point-joining radius.svg";
 import rotateDrawingIcon from "./icons/rotate-drawing.svg";
@@ -36,7 +54,7 @@ const defaultVisualizationOptions = {
   colorPathsByStrokeOrder: false,
 };
 
-const initialState = {
+const baseState = {
   connected: true,
 
   paused: false,
@@ -54,18 +72,67 @@ const initialState = {
   paths: null as Path[] | null,
   groupLayers: [] as string[],
   strokeLayers: [] as string[],
+  /** Name of the loaded file, sent along with the plot. */
+  fileName: null as string | null,
 
   // While a plot is in progress, this will be the index of the current motion.
   progress: null as number | null,
+
+  /** HP-GL: the carousel pen to plot with. */
+  pen: 1,
+  /** Something to tell, e.g. why the server refused a plot. */
+  notice: null as string | null,
 };
 
-// Update the initial state with previously persisted settings (if present)
+type State = typeof baseState;
 
-const persistedPlanOptions = JSON.parse(window.localStorage.getItem("planOptions") ?? "{}");
-initialState.planOptions = { ...initialState.planOptions, ...persistedPlanOptions };
-initialState.planOptions.paperSize = new PaperSize(initialState.planOptions.paperSize.size);
+/** Where the plan options are kept in the browser: per plotter, with the old single key for the first one. */
+function planOptionsKey(plotterId: string | null): string {
+  return plotterId && plotterId !== "default" ? `planOptions:${plotterId}` : "planOptions";
+}
 
-type State = typeof initialState;
+function readJson(key: string): Record<string, unknown> {
+  try {
+    return JSON.parse(window.localStorage.getItem(key) ?? "{}") ?? {};
+  } catch {
+    return {};
+  }
+}
+
+/** Drawings loaded for each plotter, so that switching back and forth keeps them. */
+const drawings = new Map<string, Pick<State, "paths" | "groupLayers" | "strokeLayers" | "fileName">>();
+
+/**
+ * The plot view's state for a plotter: plan options saved in this browser, with the plotter's own calibration
+ * (pen heights, speeds) from the server on top, and the drawing loaded for it before.
+ */
+function initialStateFor(plotter: PlotterWithStatus | null): State {
+  const key = plotter?.id ?? "web";
+  const persisted = readJson(planOptionsKey(plotter?.id ?? null));
+  const planOptions: PlanOptions = { ...defaultPlanOptions, ...(persisted as Partial<PlanOptions>) };
+  if (plotter) {
+    const { pen: _pen, ...machine } = plotter.settings;
+    Object.assign(planOptions, machine);
+    planOptions.hardware = planHardwareFor(plotter);
+    // a new HP-GL plotter starts with the paper it is set to
+    if (plotter.kind === "hpgl" && !persisted.paperSize) {
+      const size = plotter.status.paper?.size ?? PaperSize.standard.A4.landscape.size;
+      planOptions.paperSize = new PaperSize({ ...size });
+    }
+  }
+  planOptions.paperSize = new PaperSize(planOptions.paperSize.size);
+  // sets don't survive JSON (older versions saved them as {}): the layers are chosen again when a drawing loads
+  const savedLayers = (layers: unknown) => new Set<string>(Array.isArray(layers) ? layers : []);
+  planOptions.selectedGroupLayers = savedLayers(persisted.selectedGroupLayers);
+  planOptions.selectedStrokeLayers = savedLayers(persisted.selectedStrokeLayers);
+  const drawing = drawings.get(key);
+  return {
+    ...baseState,
+    planOptions,
+    ...drawing,
+    pen: plotter?.settings.pen ?? 1,
+  };
+}
 
 type Action =
   | { type: "SET_PLAN_OPTION"; value: Partial<State["planOptions"]> }
@@ -74,8 +141,11 @@ type Action =
   | { type: "SET_PAUSED"; value: boolean }
   | { type: "SET_PROGRESS"; motionIdx: number | null }
   | { type: "SET_CONNECTED"; connected: boolean }
+  | { type: "SET_PEN"; pen: number }
+  | { type: "SET_NOTICE"; notice: string | null }
   | {
       type: "SET_PATHS";
+      fileName?: string | null;
       paths: State["paths"];
       strokeLayers: State["strokeLayers"];
       selectedStrokeLayers: State["planOptions"]["selectedStrokeLayers"];
@@ -109,6 +179,7 @@ function reducer(state: State, action: Action): State {
       return {
         ...state,
         paths,
+        fileName: action.fileName ?? null,
         groupLayers,
         strokeLayers,
         planOptions: { ...state.planOptions, selectedStrokeLayers, selectedGroupLayers, layerMode },
@@ -118,6 +189,10 @@ function reducer(state: State, action: Action): State {
       return { ...state, progress: action.motionIdx };
     case "SET_CONNECTED":
       return { ...state, connected: action.connected };
+    case "SET_PEN":
+      return { ...state, pen: action.pen };
+    case "SET_NOTICE":
+      return { ...state, notice: action.notice };
     default:
       console.warn(`Unrecognized action '${{ action }}'`);
       return state;
@@ -138,10 +213,8 @@ function attemptRejigger(previousOptions: PlanOptions, newOptions: PlanOptions, 
   if (serialize(previousOptions) === serialize(newOptionsWithOldPenHeights)) {
     const device = Device(newOptions.hardware);
     // The existing plan should be the same except for penup/pendown heights.
-    return previousPlan.withPenHeights(
-      device.penPctToPos(newOptions.penUpHeight),
-      device.penPctToPos(newOptions.penDownHeight),
-    );
+    const pen = penPositions(device, newOptions.penUpHeight, newOptions.penDownHeight);
+    return previousPlan.withPenHeights(pen.up, pen.down);
   }
   return null;
 }
@@ -195,7 +268,7 @@ const usePlan = (paths: Path[] | null, planOptions: PlanOptions) => {
   return { isPlanning, plan: latestPlan, setPlan };
 };
 
-const setPaths = (paths: Path[]): Action => {
+const setPaths = (paths: Path[], fileName: string | null = null): Action => {
   const strokes = new Set<string>();
   const groups = new Set<string>();
   for (const path of paths) {
@@ -207,6 +280,7 @@ const setPaths = (paths: Path[]): Action => {
   const strokeLayers = Array.from(strokes).sort();
   return {
     type: "SET_PATHS",
+    fileName,
     paths,
     groupLayers,
     strokeLayers,
@@ -300,6 +374,84 @@ function HardwareOptions({ state, driver }: { state: State; driver: BaseDriver |
   );
 }
 
+/** Pen controls for HP-GL plotters: a carousel pen that is only up or down, and a pen speed. */
+function HpglPenControls({ state, driver }: { state: State; driver: BaseDriver | null }) {
+  const dispatch = useContext(DispatchContext);
+  const saxi = driver instanceof SaxiDriver ? driver : null;
+  const speed = state.planOptions.penDownMaxVelocity;
+  const plotting = state.progress !== null;
+  return (
+    <Fragment>
+      <div className="flex">
+        <label className="pen-label" title="The carousel pen to plot with">
+          pen
+          <select
+            value={state.pen}
+            onChange={(e) => dispatch({ type: "SET_PEN", pen: Number(e.target.value) })}
+            disabled={plotting}
+          >
+            {[1, 2, 3, 4, 5, 6].map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="pen-label" title="Drawing speed (VS), at most 381 mm/s. Technical pens like 100 or less.">
+          speed (mm/s)
+          <input
+            type="number"
+            min="4"
+            max="381"
+            step="1"
+            value={speed}
+            onChange={(e) =>
+              dispatch({ type: "SET_PLAN_OPTION", value: { penDownMaxVelocity: Number(e.target.value) } })
+            }
+          />
+        </label>
+      </div>
+      <div className="flex">
+        <button type="button" disabled={!saxi || plotting} onClick={() => saxi?.selectPen(state.pen)}>
+          get pen {state.pen}
+        </button>
+        <button type="button" disabled={!driver || plotting} onClick={() => driver?.limp()}>
+          put pen away
+        </button>
+      </div>
+      <div className="flex">
+        <button type="button" disabled={!driver || plotting} onClick={() => driver?.setPenHeight(1, 0)}>
+          pen up
+        </button>
+        <button type="button" disabled={!driver || plotting} onClick={() => driver?.setPenHeight(0, 0)}>
+          pen down
+        </button>
+      </div>
+    </Fragment>
+  );
+}
+
+/** Warns when the drawing's paper doesn't match the paper the HP-GL plotter is set to. */
+function PlotterPaperNotice({ state }: { state: State }) {
+  const paper = state.deviceInfo?.paper;
+  if (!paper) return null;
+  const size = state.planOptions.paperSize.size;
+  if (!paperFits(size, paper)) {
+    return (
+      <div className="plotter-notice">
+        The plotter is set to {paper.name}, smaller than this {Math.round(size.x)}×{Math.round(size.y)} mm paper. Press
+        SIZE on the plotter or pick a smaller paper.
+      </div>
+    );
+  }
+  const exact = HP7475A_FRAMES.some(
+    (f) => f.paper.name === paper.name && Math.abs(Math.max(size.x, size.y) - f.paper.size.x) < 2,
+  );
+  return exact ? null : (
+    <div className="camera-hint">The plotter is set to {paper.name} paper: the drawing is centred on it.</div>
+  );
+}
+
 function VisualizationOptions({ state }: { state: State }) {
   const dispatch = useContext(DispatchContext);
 
@@ -338,6 +490,7 @@ function VisualizationOptions({ state }: { state: State }) {
 function OriginOptions({ state }: { state: State }) {
   const dispatch = useContext(DispatchContext);
   const device = Device(state.planOptions.hardware);
+  if (device.binaryPen) return null; // an HP-GL plotter puts its pen away at the end
   return (
     <div className="flex">
       <label title="Starting and final position of pen when plotting (x)">
@@ -562,6 +715,30 @@ function TimeLeft({
   );
 }
 
+/** Marks the side of the paper at the plotter's pen carousel: its left, which is the top of a portrait drawing. */
+function CarouselMarker({ paperSize }: { paperSize: Vec2 }) {
+  const band = 8; // mm
+  const landscape = paperSize.x >= paperSize.y;
+  const x = landscape ? band / 2 : paperSize.x / 2;
+  const y = landscape ? paperSize.y / 2 : band / 2;
+  return (
+    <g className="preview-carousel">
+      <title>The plotter's pen carousel is on this side</title>
+      <rect width={landscape ? band : paperSize.x} height={landscape ? paperSize.y : band} />
+      <text
+        x={x}
+        y={y}
+        fontSize="4.5"
+        textAnchor="middle"
+        dominantBaseline="central"
+        transform={landscape ? `rotate(-90 ${x} ${y})` : undefined}
+      >
+        carousel
+      </text>
+    </g>
+  );
+}
+
 function PlanPreview({
   state,
   previewSize,
@@ -586,10 +763,14 @@ function PlanPreview({
         .filter((m) => m.length);
       return (
         <g transform={`scale(${1 / device.stepsPerMm})`}>
-          <title>Pen home</title>
-          <text x={lines[0][0].x} y={lines[0][0].y} fontSize="40" textAnchor="middle" dominantBaseline="middle">
-            ꚛ
-          </text>
+          {!device.binaryPen && (
+            <>
+              <title>Pen home</title>
+              <text x={lines[0][0].x} y={lines[0][0].y} fontSize="40" textAnchor="middle" dominantBaseline="middle">
+                ꚛ
+              </text>
+            </>
+          )}
           {lines.map((line, i) => (
             <path
               // biome-ignore lint/suspicious/noArrayIndexKey: the paths are not changed elsewhere
@@ -606,7 +787,7 @@ function PlanPreview({
       );
     }
     return null;
-  }, [plan, strokeWidth, colorPathsByStrokeOrder, device.stepsPerMm]);
+  }, [plan, strokeWidth, colorPathsByStrokeOrder, device.stepsPerMm, device.binaryPen]);
 
   // w/h of svg.
   // first try scaling so that h = area.h. if w < area.w, then ok.
@@ -692,6 +873,7 @@ function PlanPreview({
         <title>Plot preview</title>
         {memoizedPlanPreview}
         {margins}
+        {device.binaryPen && <CarouselMarker paperSize={ps.size} />}
       </svg>
       {progressIndicator}
     </div>
@@ -751,12 +933,15 @@ function PlotButtons({
   plan,
   isPlanning,
   driver,
+  job,
 }: {
   state: State;
   plan: Plan | null;
   isPlanning: boolean;
   driver: BaseDriver;
+  job: PlotJobInfo;
 }) {
+  const dispatch = useContext(DispatchContext);
   function cancel() {
     driver.cancel();
   }
@@ -767,7 +952,8 @@ function PlotButtons({
     driver.resume();
   }
   function plot(plan: Plan) {
-    driver.plot(plan);
+    dispatch({ type: "SET_NOTICE", notice: null });
+    driver.plot(plan, job);
   }
 
   return (
@@ -808,12 +994,39 @@ function PlotButtons({
   );
 }
 
-function ResetToDefaultsButton() {
+/** Offers the plan as an HP-GL file, as it would be sent to the plotter. */
+function HpglDownload({ state, plan }: { state: State; plan: Plan | null }) {
+  if (!plan || !Device(state.planOptions.hardware).binaryPen) return null;
+  const download = () => {
+    const paperSize = state.planOptions.paperSize.size;
+    const paper = state.deviceInfo?.paper;
+    const frame = (paper && frameForName(paper.name)) || frameForPaper(paperSize);
+    const program = hpglProgram(plan, {
+      paperSize,
+      frame,
+      pen: state.pen,
+      penSpeed: state.planOptions.penDownMaxVelocity,
+    });
+    const url = URL.createObjectURL(new Blob([program], { type: "application/vnd.hp-hpgl" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${(state.fileName ?? "drawing").replace(/\.svg$/i, "")}.hpgl`;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 10000);
+  };
+  return (
+    <button type="button" className="button-link" onClick={download}>
+      download .hpgl
+    </button>
+  );
+}
+
+function ResetToDefaultsButton({ storageKey, hardware }: { storageKey: string; hardware: PlanOptions["hardware"] }) {
   const dispatch = useContext(DispatchContext);
   const onClick = () => {
     // Clear all user settings that have been saved and reset to the defaults
-    window.localStorage.removeItem("planOptions");
-    dispatch({ type: "SET_PLAN_OPTION", value: { ...defaultPlanOptions } });
+    window.localStorage.removeItem(storageKey);
+    dispatch({ type: "SET_PLAN_OPTION", value: { ...defaultPlanOptions, hardware } });
   };
 
   return (
@@ -900,96 +1113,100 @@ function PlanConfig({ state }: { state: State }) {
             }
           />
         </label>
-        <div className="flex">
-          <label title="Acceleration when the pen is down (in mm/s^2)">
-            down acc. (mm/s<sup>2</sup>)
-            <input
-              type="number"
-              value={state.planOptions.penDownAcceleration}
-              step="0.1"
-              min="0"
-              onChange={(e) =>
-                dispatch({ type: "SET_PLAN_OPTION", value: { penDownAcceleration: Number(e.target.value) } })
-              }
-            />
-          </label>
-          <label title="Maximum velocity when the pen is down (in mm/s)">
-            down max vel. (mm/s)
-            <input
-              type="number"
-              value={state.planOptions.penDownMaxVelocity}
-              step="0.1"
-              min="0"
-              onChange={(e) =>
-                dispatch({ type: "SET_PLAN_OPTION", value: { penDownMaxVelocity: Number(e.target.value) } })
-              }
-            />
-          </label>
-        </div>
-        <label>
-          cornering factor
-          <input
-            type="number"
-            value={state.planOptions.penDownCorneringFactor}
-            step="0.01"
-            min="0"
-            onChange={(e) =>
-              dispatch({ type: "SET_PLAN_OPTION", value: { penDownCorneringFactor: Number(e.target.value) } })
-            }
-          />
-        </label>
-        <div className="flex">
-          <label title="Acceleration when the pen is up (in mm/s^2)">
-            up acc. (mm/s<sup>2</sup>)
-            <input
-              type="number"
-              value={state.planOptions.penUpAcceleration}
-              step="0.1"
-              min="0"
-              onChange={(e) =>
-                dispatch({ type: "SET_PLAN_OPTION", value: { penUpAcceleration: Number(e.target.value) } })
-              }
-            />
-          </label>
-          <label title="Maximum velocity when the pen is up (in mm/s)">
-            up max vel. (mm/s)
-            <input
-              type="number"
-              value={state.planOptions.penUpMaxVelocity}
-              step="0.1"
-              min="0"
-              onChange={(e) =>
-                dispatch({ type: "SET_PLAN_OPTION", value: { penUpMaxVelocity: Number(e.target.value) } })
-              }
-            />
-          </label>
-        </div>
-        <div className="flex">
-          <label title="How long the pen takes to lift (in seconds)">
-            pen lift duration (s)
-            <input
-              type="number"
-              value={state.planOptions.penLiftDuration}
-              step="0.01"
-              min="0"
-              onChange={(e) =>
-                dispatch({ type: "SET_PLAN_OPTION", value: { penLiftDuration: Number(e.target.value) } })
-              }
-            />
-          </label>
-          <label title="How long the pen takes to drop (in seconds)">
-            pen drop duration (s)
-            <input
-              type="number"
-              value={state.planOptions.penDropDuration}
-              step="0.01"
-              min="0"
-              onChange={(e) =>
-                dispatch({ type: "SET_PLAN_OPTION", value: { penDropDuration: Number(e.target.value) } })
-              }
-            />
-          </label>
-        </div>
+        {!Device(state.planOptions.hardware).fixedOptions && (
+          <Fragment>
+            <div className="flex">
+              <label title="Acceleration when the pen is down (in mm/s^2)">
+                down acc. (mm/s<sup>2</sup>)
+                <input
+                  type="number"
+                  value={state.planOptions.penDownAcceleration}
+                  step="0.1"
+                  min="0"
+                  onChange={(e) =>
+                    dispatch({ type: "SET_PLAN_OPTION", value: { penDownAcceleration: Number(e.target.value) } })
+                  }
+                />
+              </label>
+              <label title="Maximum velocity when the pen is down (in mm/s)">
+                down max vel. (mm/s)
+                <input
+                  type="number"
+                  value={state.planOptions.penDownMaxVelocity}
+                  step="0.1"
+                  min="0"
+                  onChange={(e) =>
+                    dispatch({ type: "SET_PLAN_OPTION", value: { penDownMaxVelocity: Number(e.target.value) } })
+                  }
+                />
+              </label>
+            </div>
+            <label>
+              cornering factor
+              <input
+                type="number"
+                value={state.planOptions.penDownCorneringFactor}
+                step="0.01"
+                min="0"
+                onChange={(e) =>
+                  dispatch({ type: "SET_PLAN_OPTION", value: { penDownCorneringFactor: Number(e.target.value) } })
+                }
+              />
+            </label>
+            <div className="flex">
+              <label title="Acceleration when the pen is up (in mm/s^2)">
+                up acc. (mm/s<sup>2</sup>)
+                <input
+                  type="number"
+                  value={state.planOptions.penUpAcceleration}
+                  step="0.1"
+                  min="0"
+                  onChange={(e) =>
+                    dispatch({ type: "SET_PLAN_OPTION", value: { penUpAcceleration: Number(e.target.value) } })
+                  }
+                />
+              </label>
+              <label title="Maximum velocity when the pen is up (in mm/s)">
+                up max vel. (mm/s)
+                <input
+                  type="number"
+                  value={state.planOptions.penUpMaxVelocity}
+                  step="0.1"
+                  min="0"
+                  onChange={(e) =>
+                    dispatch({ type: "SET_PLAN_OPTION", value: { penUpMaxVelocity: Number(e.target.value) } })
+                  }
+                />
+              </label>
+            </div>
+            <div className="flex">
+              <label title="How long the pen takes to lift (in seconds)">
+                pen lift duration (s)
+                <input
+                  type="number"
+                  value={state.planOptions.penLiftDuration}
+                  step="0.01"
+                  min="0"
+                  onChange={(e) =>
+                    dispatch({ type: "SET_PLAN_OPTION", value: { penLiftDuration: Number(e.target.value) } })
+                  }
+                />
+              </label>
+              <label title="How long the pen takes to drop (in seconds)">
+                pen drop duration (s)
+                <input
+                  type="number"
+                  value={state.planOptions.penDropDuration}
+                  step="0.01"
+                  min="0"
+                  onChange={(e) =>
+                    dispatch({ type: "SET_PLAN_OPTION", value: { penDropDuration: Number(e.target.value) } })
+                  }
+                />
+              </label>
+            </div>
+          </Fragment>
+        )}
       </div>
     </div>
   );
@@ -1048,6 +1265,14 @@ function PortSelector({ driver, setDriver, hardware }: PortSelectorProps) {
   );
 }
 
+/** Which tab a URL hash shows. */
+function viewFromHash(): View {
+  if (IS_WEB) return "plot";
+  if (window.location.hash === "#camera") return "camera";
+  if (window.location.hash === "#plotters") return "plotters";
+  return "plot";
+}
+
 function Root() {
   const [driver, setDriver] = useState<BaseDriver | null>(null);
   const [isDriverConnected, setIsDriverConnected] = useState(false);
@@ -1060,26 +1285,173 @@ function Root() {
     })();
   }, [isDriverConnected]);
 
-  const [state, dispatch] = useReducer(reducer, initialState);
-  const { isPlanning, plan, setPlan } = usePlan(state.paths, state.planOptions);
-  const [isLoadingFile, setIsLoadingFile] = useState(false);
+  // The plotters of the saxi server, and the one the plot view is about
+  const { plotters, refresh, error } = usePlotters(!IS_WEB);
+  const [selectedId, setSelectedId] = useState<string | null>(() => window.localStorage.getItem("plotter"));
+  const selected = plotters.find((p) => p.id === selectedId) ?? plotters[0] ?? null;
+  const select = (id: string) => {
+    setSelectedId(id);
+    window.localStorage.setItem("plotter", id);
+  };
+  const selectedPlotterId = selected?.id ?? null;
+  useEffect(() => {
+    if (driver instanceof SaxiDriver && selectedPlotterId) driver.setPlotter(selectedPlotterId);
+  }, [driver, selectedPlotterId]);
 
-  // The camera tab only exists in server mode; the plot view stays mounted (hidden) while it is shown.
-  const [view, setView] = useState<View>(() => (!IS_WEB && window.location.hash === "#camera" ? "camera" : "plot"));
+  // The camera and plotters tabs only exist in server mode; the plot view stays mounted (hidden) while they are shown.
+  const [view, setView] = useState<View>(viewFromHash);
   useEffect(() => {
     if (IS_WEB) return;
-    const target = view === "camera" ? "#camera" : "";
+    const target = view === "plot" ? "" : `#${view}`;
     if (window.location.hash !== target) {
       history.replaceState(null, "", `${window.location.pathname}${window.location.search}${target}`);
     }
-    const onHashChange = () => setView(window.location.hash === "#camera" ? "camera" : "plot");
+    const onHashChange = () => setView(viewFromHash());
     window.addEventListener("hashchange", onHashChange);
     return () => window.removeEventListener("hashchange", onHashChange);
   }, [view]);
 
+  const title = (
+    <div className={"saxi-title red"}>
+      <span className="red reg">s</span>
+      <span className="teal">axi</span>
+    </div>
+  );
+  const tabs = IS_WEB ? null : <ViewTabs view={view} setView={setView} />;
+  // in server mode, wait for the plotter list so the plot view starts with the right plotter's settings
+  const ready = IS_WEB || selected !== null;
+
+  return (
+    <>
+      {view === "camera" && <CameraView tabs={tabs} title={title} />}
+      {view === "plotters" && (
+        <PlottersView
+          tabs={tabs}
+          title={title}
+          plotters={plotters}
+          refresh={refresh}
+          error={error}
+          onOpen={(id) => {
+            select(id);
+            setView("plot");
+          }}
+        />
+      )}
+      {ready ? (
+        <PlotView
+          key={selected?.id ?? "web"}
+          hidden={view !== "plot"}
+          driver={driver}
+          setDriver={setDriver}
+          plotter={selected}
+          plotters={plotters}
+          onSelectPlotter={select}
+          onSettingsSaved={refresh}
+          title={title}
+          tabs={tabs}
+        />
+      ) : (
+        view === "plot" && (
+          <div className="root">
+            <div className="control-panel">
+              {title}
+              {tabs}
+              <div className="info">{error ?? "connecting…"}</div>
+            </div>
+          </div>
+        )
+      )}
+    </>
+  );
+}
+
+/** Saves the plotter's calibration (pen heights, speeds, pen) to the server, a moment after it is changed. */
+function useMachineSettings(plotter: PlotterWithStatus | null, state: State, onSaved: () => void) {
+  const settings = useMemo(() => {
+    const picked: PlotterSettings = {};
+    for (const key of MACHINE_SETTING_KEYS) {
+      (picked as Record<string, unknown>)[key] = state.planOptions[key];
+    }
+    if (plotter?.kind === "hpgl") picked.pen = state.pen;
+    return picked;
+  }, [state.planOptions, state.pen, plotter?.kind]);
+  // what the settings were when the view opened, or when they were last saved
+  const baseline = useRef<string | null>(null);
+  // a change not saved yet, saved right away if the view closes (e.g. switching plotters) before the timer fires
+  const unsaved = useRef<(() => void) | null>(null);
+  const id = plotter?.id ?? null;
   useEffect(() => {
-    window.localStorage.setItem("planOptions", JSON.stringify(state.planOptions));
-  }, [state.planOptions]);
+    if (!id) return;
+    const json = JSON.stringify(settings);
+    if (baseline.current === null) {
+      baseline.current = json;
+      return;
+    }
+    if (json === baseline.current) {
+      unsaved.current = null; // changed back
+      return;
+    }
+    const save = () => {
+      unsaved.current = null;
+      fetch(`/plotters/${encodeURIComponent(id)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ settings }),
+      })
+        .then((res) => {
+          if (!res.ok) return;
+          baseline.current = json;
+          onSaved();
+        })
+        .catch(() => {});
+    };
+    unsaved.current = save;
+    const timer = window.setTimeout(save, 800);
+    return () => window.clearTimeout(timer);
+  }, [id, settings, onSaved]);
+  useEffect(() => () => unsaved.current?.(), []);
+}
+
+function PlotView({
+  hidden,
+  driver,
+  setDriver,
+  plotter,
+  plotters,
+  onSelectPlotter,
+  onSettingsSaved,
+  title,
+  tabs,
+}: {
+  hidden: boolean;
+  driver: BaseDriver | null;
+  setDriver: (driver: BaseDriver) => void;
+  plotter: PlotterWithStatus | null;
+  plotters: PlotterWithStatus[];
+  onSelectPlotter: (id: string) => void;
+  onSettingsSaved: () => Promise<void>;
+  title: React.ReactNode;
+  tabs: React.ReactNode;
+}) {
+  const [state, dispatch] = useReducer(reducer, plotter, initialStateFor);
+  const { isPlanning, plan, setPlan } = usePlan(state.paths, state.planOptions);
+  const [isLoadingFile, setIsLoadingFile] = useState(false);
+  const storageKey = planOptionsKey(plotter?.id ?? null);
+  const hpgl = Device(state.planOptions.hardware).binaryPen === true;
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      storageKey,
+      JSON.stringify(state.planOptions, (_k, v) => (v instanceof Set ? [...v] : v)),
+    );
+  }, [state.planOptions, storageKey]);
+  useMachineSettings(plotter, state, onSettingsSaved);
+
+  const { paths, groupLayers, strokeLayers, fileName } = state;
+  const drawingKey = plotter?.id ?? "web";
+  useEffect(() => {
+    drawings.set(drawingKey, { paths, groupLayers, strokeLayers, fileName });
+  }, [paths, groupLayers, strokeLayers, fileName, drawingKey]);
 
   // biome-ignore lint/correctness/useExhaustiveDependencies(setPlan): React setters are stable
   useEffect(() => {
@@ -1092,7 +1464,8 @@ function Root() {
     };
     driver.ondevinfo = (devInfo: DeviceInfo) => {
       dispatch({ type: "SET_DEVICE_INFO", value: devInfo });
-      dispatch({ type: "SET_PLAN_OPTION", value: { ...state.planOptions, hardware: devInfo.hardware } });
+      const hardware = devInfo.kind === "hpgl" ? "hp7475a" : devInfo.hardware;
+      if (hardware !== state.planOptions.hardware) dispatch({ type: "SET_PLAN_OPTION", value: { hardware } });
     };
     driver.onpause = (paused: boolean) => {
       dispatch({ type: "SET_PAUSED", value: paused });
@@ -1100,6 +1473,9 @@ function Root() {
     driver.onplan = (plan: Plan) => {
       setPlan(plan);
     };
+    if (driver instanceof SaxiDriver) {
+      driver.onerror = (message) => dispatch({ type: "SET_NOTICE", notice: message });
+    }
   }, [driver, state.planOptions]);
 
   useEffect(() => {
@@ -1120,7 +1496,7 @@ function Root() {
 
       const reader = new FileReader();
       reader.onload = () => {
-        dispatch(setPaths(readSvg(reader.result as string)));
+        dispatch(setPaths(readSvg(reader.result as string), file.name));
         setIsLoadingFile(false);
       };
       reader.onerror = () => {
@@ -1132,6 +1508,7 @@ function Root() {
   );
 
   useEffect(() => {
+    if (hidden) return;
     // Called when the user drags and drops the image
     const ondrop = (e: DragEvent) => {
       e.preventDefault();
@@ -1149,7 +1526,7 @@ function Root() {
     };
     const onpaste = (e: ClipboardEvent) => {
       e.clipboardData?.items[0].getAsString((s) => {
-        dispatch(setPaths(readSvg(s)));
+        dispatch(setPaths(readSvg(s), "pasted drawing"));
       });
     };
     document.body.addEventListener("drop", ondrop);
@@ -1162,7 +1539,7 @@ function Root() {
       document.body.removeEventListener("dragleave", ondragleave);
       document.removeEventListener("paste", onpaste);
     };
-  }, [handleFile]);
+  }, [handleFile, hidden]);
 
   // Each time new motion is started, save the start time
   // biome-ignore lint/correctness/useExhaustiveDependencies: currentMotionStartedTime should be re-set with each motion
@@ -1174,50 +1551,62 @@ function Root() {
   const previewSize = useComponentSize(previewArea);
   const showDragTarget = !plan && !isLoadingFile && !isPlanning;
 
-  const title = (
-    <div className={"saxi-title red"}>
-      <span className="red reg">s</span>
-      <span className="teal">axi</span>
-    </div>
-  );
-  const tabs = IS_WEB ? null : <ViewTabs view={view} setView={setView} />;
+  const job: PlotJobInfo = {
+    name: state.fileName ?? "drawing",
+    paperSize: state.planOptions.paperSize.size,
+    hardware: state.planOptions.hardware,
+    ...(hpgl ? { pen: state.pen, penSpeed: state.planOptions.penDownMaxVelocity } : {}),
+  };
+
+  const deviceName = plotter?.name ?? "EBB";
+  const connection = !state.connected
+    ? "disconnected"
+    : state.deviceInfo?.path
+      ? hpgl
+        ? `${state.deviceInfo.model ?? "HP-GL plotter"} at ${state.deviceInfo.path}${state.deviceInfo.paper ? `, ${state.deviceInfo.paper.name} paper` : ""}`
+        : `Connected to EBB at ${state.deviceInfo.path}`
+      : plotter
+        ? `${deviceName}: ${connectionLabel({ ...plotter, status: { ...plotter.status, connected: false } })}`
+        : "Not connected to EBB";
 
   return (
     <DispatchContext.Provider value={dispatch}>
-      {view === "camera" && <CameraView tabs={tabs} title={title} />}
       <div
         className={`root ${state.connected ? "connected" : "disconnected"}`}
-        style={view === "camera" ? { display: "none" } : undefined}
+        style={hidden ? { display: "none" } : undefined}
       >
         <div className="control-panel">
           {title}
           {tabs}
+          {!IS_WEB && <PlotterSwitcher plotters={plotters} selected={plotter?.id ?? null} onSelect={onSelectPlotter} />}
           {!IS_WEB && (
-            <div className={state.connected && state.deviceInfo?.path ? "info" : "info-disconnected"}>
-              {state.connected
-                ? state.deviceInfo?.path
-                  ? `Connected to EBB at ${state.deviceInfo.path}`
-                  : "Not connected to EBB"
-                : "disconnected"}
-            </div>
+            <div className={state.connected && state.deviceInfo?.path ? "info" : "info-disconnected"}>{connection}</div>
           )}
+          {!IS_WEB && state.deviceInfo?.attention && <div className="plotter-notice">{state.deviceInfo.attention}</div>}
           {IS_WEB && (
             <PortSelector
               driver={driver}
               setDriver={setDriver}
-              hardware={(driver as WebSerialDriver)?.ebb?.hardware ?? state.planOptions.hardware}
+              hardware={(driver as WebSerialDriver)?.ebb?.hardware ?? (state.planOptions.hardware as Hardware)}
             />
           )}
           <div className="section-header">pen</div>
           <div className="section-body">
-            <PenHeight state={state} driver={driver} />
-            <MotorControl driver={driver} />
-            <HardwareOptions state={state} driver={driver} />
-            <ResetToDefaultsButton />
+            {hpgl ? (
+              <HpglPenControls state={state} driver={driver} />
+            ) : (
+              <>
+                <PenHeight state={state} driver={driver} />
+                <MotorControl driver={driver} />
+                <HardwareOptions state={state} driver={driver} />
+              </>
+            )}
+            <ResetToDefaultsButton storageKey={storageKey} hardware={state.planOptions.hardware} />
           </div>
           <div className="section-header">paper</div>
           <div className="section-body">
             <PaperConfig state={state} />
+            {hpgl && <PlotterPaperNotice state={state} />}
             <LayerSelector state={state} />
           </div>
           <details>
@@ -1239,7 +1628,9 @@ function Root() {
                 currentMotionStartedTime={currentMotionStartedTime}
                 paused={state.paused}
               />
-              <PlotButtons plan={plan} isPlanning={isPlanning} state={state} driver={driver} />
+              {state.notice && <div className="plotter-notice">{state.notice}</div>}
+              <PlotButtons plan={plan} isPlanning={isPlanning} state={state} driver={driver} job={job} />
+              <HpglDownload state={state} plan={plan} />
             </div>
           </div>
         </div>

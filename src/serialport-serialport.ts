@@ -53,6 +53,7 @@ export class SerialPortSerialPort extends EventEmitter implements SerialPort {
     if (options.dataBits != null) opts.dataBits = options.dataBits;
     if (options.stopBits != null) opts.stopBits = options.stopBits;
     if (options.parity != null) opts.parity = options.parity;
+    if (options.flowControl === "hardware") opts.rtscts = true;
 
     return new Promise((resolve, reject) => {
       this._port = new NodeSerialPort(opts, (openErr) => {

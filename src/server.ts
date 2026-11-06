@@ -1,7 +1,7 @@
 /**
- * Backend web server for controlling the EBB.
+ * Backend web server for controlling the plotters.
  * Serve both the front end UI as static files - made with React, and backend
- * API for controlling the EBB.
+ * API for controlling the plotters (see plotter-routes.ts) and cameras (camera-routes.ts).
  * Keep open web sockets to the front end for real-time updates.
  */
 
@@ -13,50 +13,39 @@ import { fileURLToPath } from "node:url";
 import { autoDetect } from "@serialport/bindings-cpp";
 import type { PortInfo } from "@serialport/bindings-interface";
 import cors from "cors";
-import type { Request, Response } from "express";
 import express from "express";
 import type WebSocket from "ws";
 import { WebSocketServer } from "ws";
-import { createMockSerialPort } from "./__tests__/mocks/serialport.js";
 import { mountCameraRoutes } from "./camera-routes.js";
 import { CameraManager } from "./camera.js";
-import { EBB, type EBBPort, type Hardware } from "./ebb.js";
-import { type Motion, PenMotion, Plan } from "./planning.js";
+import { EBB, type Hardware } from "./ebb.js";
+import type { Plotter } from "./plotter.js";
+import { PlotterManager } from "./plotter-manager.js";
+import { mountPlotterRoutes } from "./plotter-routes.js";
 import { SerialPortSerialPort } from "./serialport-serialport.js";
-import * as _self from "./server.js"; // use self-import for test mocking
 import { TimelapseRecorder } from "./timelapse.js";
-import { formatDuration } from "./util.js";
 
 type Com = string;
-
-/** Before a plot, the pen moves to its starting height and the EBB waits this long before the first motion. */
-const PRE_PLOT_PEN_DELAY_MS = 1000;
-
-/**
- * Shorthand for getting the device info, either EBB or com port.
- * @param ebb
- * @param com
- * @returns
- */
-const getDeviceInfo = (ebb: EBB | null, _com: Com) => {
-  // biome-ignore lint/suspicious/noExplicitAny: private member access
-  const portPath = (ebb?.port as any)?._path ?? null;
-  return { path: portPath, hardware: ebb?.hardware };
-};
 
 /** Where saxi keeps camera settings and timelapse recordings unless told otherwise. */
 export function defaultDataDir(): string {
   return process.env.SAXI_DATA_DIR || path.join(os.homedir(), ".saxi");
 }
 
+interface Client {
+  ws: WebSocket;
+  /** The plotter this client watches. */
+  plotter: string;
+}
+
 /**
  * Start the express server.
  * @param port
- * @param hardware
- * @param com
+ * @param hardware model of the AxiDraw saxi starts with when no plotters are configured
+ * @param com serial port of the first AxiDraw (default: the first one found)
  * @param enableCors
  * @param maxPayloadSize
- * @param dataDir directory for camera settings and timelapse recordings
+ * @param dataDir directory for plotter and camera settings and timelapse recordings
  * @returns
  */
 export async function startServer(
@@ -80,263 +69,112 @@ export async function startServer(
   // Web and Socket server
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server });
+  const clients = new Set<Client>();
 
-  let ebb: EBB | null;
-  let clients: WebSocket[] = [];
-  let unpaused: Promise<void> | null = null;
-  let signalUnpause: (() => void) | null = null;
-  let motionIdx: number | null = null;
-  let currentPlan: Plan | null = null;
-  let plotting = false;
-  let controller: AbortController | null = null;
-
-  mountCameraRoutes(app, cameras, timelapse, () => plotting);
-
-  wss.on("connection", (ws) => {
-    clients.push(ws);
-    ws.on("message", (message) => {
-      const msg = JSON.parse(message.toString());
-      switch (msg.c) {
-        case "ping":
-          ws.send(JSON.stringify({ c: "pong" }));
-          break;
-        case "limp":
-          if (ebb) {
-            ebb.disableMotors();
-          }
-          break;
-        case "setPenHeight":
-          if (ebb) {
-            (async () => {
-              if (await ebb.supportsSR()) {
-                await ebb.setServoPowerTimeout(10000, true);
-              }
-              await ebb.setPenHeight(msg.p.height, msg.p.rate);
-            })();
-          }
-          break;
-        case "changeHardware":
-          ebb?.changeHardware(msg.p.hardware);
-          broadcast({ c: "dev", p: getDeviceInfo(ebb, com) });
-          break;
-      }
-    });
-
-    // send starting params to clients
-    ws.send(JSON.stringify({ c: "dev", p: getDeviceInfo(ebb, com) }));
-
-    ws.send(JSON.stringify({ c: "pause", p: { paused: !!unpaused } }));
-    if (motionIdx !== null) {
-      ws.send(JSON.stringify({ c: "progress", p: { motionIdx } }));
-    }
-    if (currentPlan !== null) {
-      ws.send(JSON.stringify({ c: "plan", p: { motions: currentPlan.toTransferable() } }));
-    }
-
-    ws.on("close", () => {
-      clients = clients.filter((w) => w !== ws);
-    });
-  });
-
-  /**
-   * /plot POST endpoint. Receive a plan on the POST body, and execute it.
-   */
-  app.post("/plot", async (req: Request, res: Response) => {
-    if (plotting) {
-      console.log("Received plot request, but a plot is already in progress!");
-      res.status(400).send("Plot in progress");
-      return;
-    }
-    plotting = true;
-    controller = new AbortController();
-    const { signal } = controller;
-    try {
-      const plan = Plan.deserialize(req.body);
-      currentPlan = plan;
-      console.log(`Received plan of estimated duration ${formatDuration(plan.duration())}`);
-      console.log(ebb !== null ? "Beginning plot..." : "Simulating plot...");
-      res.status(200).end();
-
-      const begin = Date.now();
-      let wakeLock: { release(): void } | null = null;
-
-      // The wake-lock module is macOS-only.
-      if (process.platform === "darwin") {
-        try {
-          // Dynamically import wake-lock only on macOS
-          const { WakeLock } = await import("wake-lock");
-          wakeLock = new WakeLock("saxi plotting");
-        } catch (_error) {
-          console.warn("Couldn't acquire wake lock. Ensure your machine does not sleep during plotting");
-        }
-      } else {
-        console.log("Wake lock not available on this platform. Ensure your machine does not sleep during plotting");
-      }
-      try {
-        const plotEbb = ebb ?? (await EBB.create(createMockSerialPort() as unknown as EBBPort));
-        await doPlot(createPlotter(plotEbb), plan, signal);
-        const end = Date.now();
-        console.log(`Plot took ${formatDuration((end - begin) / 1000)}`);
-      } finally {
-        if (wakeLock) {
-          wakeLock.release();
-        }
-      }
-    } finally {
-      plotting = false;
-      controller = null;
-    }
-  });
-
-  app.get("/plot/status", (_req, res) => {
-    res.json({ plotting });
-  });
-
-  app.post("/cancel", (_req: Request, res: Response) => {
-    if (controller) {
-      controller.abort();
-      controller = null;
-    }
-    ebb?.cancel();
-    if (unpaused) {
-      signalUnpause?.();
-      broadcast({ c: "pause", p: { paused: false } });
-    }
-    unpaused = signalUnpause = null;
-    res.status(200).end();
-  });
-
-  app.post("/pause", (_req: Request, res: Response) => {
-    if (!unpaused) {
-      unpaused = new Promise((resolve) => {
-        signalUnpause = resolve;
-      });
-      broadcast({ c: "pause", p: { paused: true } });
-    }
-    res.status(200).end();
-  });
-
-  app.post("/resume", (_req: Request, res: Response) => {
-    if (signalUnpause) {
-      signalUnpause();
-      signalUnpause = unpaused = null;
-    }
-    res.status(200).end();
-  });
-
-  function broadcast(msg: Record<string, unknown>) {
+  /** Sends a plotter's message to the clients watching it. */
+  function emit(plotterId: string, message: Record<string, unknown>) {
+    const text = JSON.stringify({ ...message, plotter: plotterId });
     for (const client of clients) {
+      if (client.plotter !== plotterId) continue;
       try {
-        client.send(JSON.stringify(msg));
+        client.ws.send(text);
       } catch (e) {
         console.warn(e);
       }
     }
   }
 
-  interface Plotter {
-    prePlot: (initialPenHeight: number) => Promise<void>;
-    executeMotion: (m: Motion, progress: [number, number]) => Promise<void>;
-    postCancel: (initialPenHeight: number) => Promise<void>;
-    postPlot: () => Promise<void>;
-  }
+  const plotters = new PlotterManager(
+    dataDir,
+    { recorder: timelapse, emit },
+    { defaultPort: com || undefined, defaultHardware: hardware },
+  );
 
-  function createPlotter(ebb: EBB): Plotter {
-    return {
-      async prePlot(initialPenHeight: number): Promise<void> {
-        await ebb.configureFifoDepth();
-        await ebb.enableMotors(1); // 16x microstepping, matches defaults from Axidraw
-        await ebb.setPenHeight(initialPenHeight, 1000, PRE_PLOT_PEN_DELAY_MS);
-      },
-      async executeMotion(motion: Motion, _progress: [number, number]): Promise<void> {
-        await ebb.executeMotion(motion);
-      },
-      async postCancel(initialPenHeight: number): Promise<void> {
-        await ebb.setPenHeight(initialPenHeight, 1000);
-        await ebb.command("HM,4000"); // HM returns carriage home without 3rd and 4th arguments
-        // The board may still be executing motion queued in its FIFO; issuing
-        // HM while moving makes the steppers grind against whatever they're doing.
-        await ebb.waitUntilMotorsIdle();
-      },
-      async postPlot(): Promise<void> {
-        await ebb.waitUntilMotorsIdle();
-        await ebb.disableMotors();
-      },
-    };
-  }
+  mountCameraRoutes(app, cameras, timelapse, {
+    plotting: () =>
+      plotters
+        .all()
+        .filter((p) => p.isPlotting)
+        .map((p) => p.id),
+    defaultId: () => plotters.default().id,
+    name: (id) => plotters.get(id)?.config.name,
+  });
+  mountPlotterRoutes(app, plotters);
 
-  async function doPlot(plotter: Plotter, plan: Plan, signal: AbortSignal): Promise<void> {
-    const abortPromise = onceAbort(signal); // reuse abort promise
-    unpaused = null;
-    signalUnpause = null;
-    motionIdx = 0;
-
-    const firstPenMotion = plan.motions.find((x) => x instanceof PenMotion) as PenMotion;
-    await timelapse.plotStarted(plan.duration()); // captures the blank page before anything moves
-    await plotter.prePlot(firstPenMotion.initialPos);
-    timelapse.plotterBusy(PRE_PLOT_PEN_DELAY_MS); // tells the timelapse when the first motion really starts
-
-    let penIsUp = true;
-    try {
-      for (const motion of plan.motions) {
-        broadcast({ c: "progress", p: { motionIdx } });
-        timelapse.plotMotion(motion);
-
-        await Promise.race([plotter.executeMotion(motion, [motionIdx, plan.motions.length]), abortPromise]);
-
-        if (motion instanceof PenMotion) {
-          penIsUp = motion.initialPos < motion.finalPos;
-        }
-
-        if (unpaused && penIsUp) {
-          await Promise.race([unpaused, abortPromise]);
-          broadcast({ c: "pause", p: { paused: false } });
-        }
-
-        motionIdx += 1;
+  wss.on("connection", (ws) => {
+    const client: Client = { ws, plotter: plotters.default().id };
+    clients.add(client);
+    const send = (plotter: Plotter) => {
+      for (const message of plotter.initialMessages()) {
+        ws.send(JSON.stringify({ ...message, plotter: plotter.id }));
       }
-
-      broadcast({ c: "finished" });
-    } catch (err) {
-      if (signal.aborted) {
-        await plotter.postCancel(firstPenMotion.initialPos);
-        broadcast({ c: "cancelled" });
+    };
+    ws.on("message", (message) => {
+      let msg: { c?: string; p?: Record<string, unknown> };
+      try {
+        msg = JSON.parse(message.toString());
+      } catch {
         return;
       }
-      throw err; // propagate real errors
-    } finally {
-      motionIdx = null;
-      currentPlan = null;
-      await plotter.postPlot();
-      await timelapse.plotEnded(signal.aborted); // final frame of the finished drawing
-    }
-  }
-
-  function onceAbort(signal: AbortSignal): Promise<never> {
-    return new Promise((_resolve, reject) => {
-      signal.throwIfAborted();
-      signal.addEventListener("abort", () => reject(new Error("Aborted")), { once: true });
+      // a command for a plotter that is gone (e.g. just removed) is dropped, not sent to another plotter;
+      // older clients name none and drive the first plotter
+      const named = msg.p?.plotter;
+      const target =
+        named !== undefined && named !== null
+          ? plotters.get(String(named))
+          : (plotters.get(client.plotter) ?? plotters.default());
+      const run = (action: (plotter: Plotter) => Promise<unknown>) => {
+        if (!target) return;
+        action(target).catch((e) => console.error(`${target.config.name}: ${(e as Error).message}`));
+      };
+      switch (msg.c) {
+        case "ping":
+          ws.send(JSON.stringify({ c: "pong" }));
+          break;
+        case "subscribe": {
+          // watch another plotter
+          const plotter = plotters.get(String(msg.p?.plotter));
+          if (plotter) {
+            client.plotter = plotter.id;
+            send(plotter);
+          }
+          break;
+        }
+        case "limp":
+          run((p) => p.limp());
+          break;
+        case "setPenHeight":
+          run((p) => p.setPenHeight(Number(msg.p?.height), Number(msg.p?.rate)));
+          break;
+        case "selectPen":
+          run((p) => p.selectPen(Number(msg.p?.pen)));
+          break;
+        case "changeHardware":
+          run(async (p) => plotters.update(p.id, { hardware: msg.p?.hardware }));
+          break;
+      }
     });
-  }
+
+    // send starting params to clients
+    send(plotters.default());
+
+    ws.on("close", () => {
+      clients.delete(client);
+    });
+  });
 
   server.on("close", () => {
     timelapse.close();
     cameras.close();
+    void plotters.close();
   });
 
   return new Promise<http.Server>((resolve) => {
-    server.listen(port, () => {
-      async function connect() {
-        const devices = ebbs(com, hardware);
-        for await (const device of devices) {
-          ebb = device;
-          broadcast({ c: "dev", p: getDeviceInfo(ebb, com) });
-        }
-      }
-      connect();
+    server.listen(port, async () => {
       const { family, address, port } = server.address() as AddressInfo;
       const addr = `${family === "IPv6" ? `[${address}]` : address}:${port}`;
       console.log(`Server listening on http://${addr}`);
+      await plotters.start();
       resolve(server);
     });
   });
@@ -377,34 +215,6 @@ export async function waitForEbb(): Promise<Com> {
       return ebbs[0];
     }
     await sleep(5000);
-  }
-}
-
-async function* ebbs(path?: string, hardware: Hardware = "v3") {
-  while (true) {
-    try {
-      const com: Com = path || (await _self.waitForEbb()); // use self-import for test mocking
-      console.log(`Found EBB at ${com}`);
-      const port = await tryOpen(com);
-      try {
-        const closed = new Promise((resolve) => {
-          port.addEventListener("disconnect", resolve, { once: true });
-        });
-        yield await EBB.create(port, hardware);
-        await closed;
-        yield null;
-        console.error("Lost connection to EBB, reconnecting...");
-      } finally {
-        if (port.connected) {
-          await port.close();
-        }
-      }
-    } catch (e) {
-      const err = e instanceof Error ? e : new Error(String(e));
-      console.error(`Error connecting to EBB: ${err.message}`);
-      console.error("Retrying in 5 seconds...");
-      await sleep(5000);
-    }
   }
 }
 

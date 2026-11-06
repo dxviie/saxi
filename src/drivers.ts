@@ -1,9 +1,16 @@
 import { EBB, type EBBPort, type Hardware } from "./ebb.js";
 import { Device, PenMotion, Plan } from "./planning.js";
+import type { PlotJobInfo, PlotJobStatus, PlotterKind, PlotterPaper } from "./plotter-types.js";
 
 export interface DeviceInfo {
-  path: string;
+  path: string | null;
   hardware: Hardware;
+  /** The rest only comes from the saxi server. */
+  kind?: PlotterKind;
+  model?: string | null;
+  paper?: PlotterPaper | null;
+  attention?: string | null;
+  name?: string;
 }
 
 /**
@@ -19,9 +26,9 @@ export abstract class BaseDriver {
   /**
    * Called when plan loaded
    */
-  public onplan: (plan: Plan) => void = () => {};
+  public onplan: (plan: Plan, job: PlotJobStatus | null) => void = () => {};
 
-  abstract plot(plan: Plan): void;
+  abstract plot(plan: Plan, job?: PlotJobInfo): void;
   abstract cancel(): void;
   abstract pause(): void;
   abstract resume(): void;
@@ -99,7 +106,7 @@ export class WebSerialDriver extends BaseDriver {
     return this.ebb.close();
   }
 
-  public async plot(plan: Plan): Promise<void> {
+  public async plot(plan: Plan, _job?: PlotJobInfo): Promise<void> {
     const microsteppingMode = 1; // 16x microstepping, matches defaults from Axidraw
     this._unpaused = null;
     this._cancelRequested = false;
@@ -185,6 +192,23 @@ export class WebSerialDriver extends BaseDriver {
 export class SaxiDriver extends BaseDriver {
   private socket!: WebSocket;
   private pingInterval: number | undefined;
+  /** The plotter this driver controls; null for the server's first plotter. */
+  private plotterId: string | null = null;
+
+  /** Control (and follow) another of the server's plotters. */
+  public setPlotter(id: string): void {
+    if (id === this.plotterId) return;
+    this.plotterId = id;
+    if (this.connected) this.send({ c: "subscribe", p: { plotter: id } });
+  }
+
+  public get plotter(): string | null {
+    return this.plotterId;
+  }
+
+  private url(action: string): string {
+    return this.plotterId ? `/plotters/${encodeURIComponent(this.plotterId)}/${action}` : `/${action}`;
+  }
 
   public name() {
     return "Saxi Server";
@@ -209,9 +233,12 @@ export class SaxiDriver extends BaseDriver {
       console.log("Connected to EBB server.");
       this.connected = true;
       this.pingInterval = window.setInterval(() => this.ping(), 30000);
+      if (this.plotterId) this.send({ c: "subscribe", p: { plotter: this.plotterId } });
     });
     this.socket.addEventListener("message", (e: MessageEvent) => {
       const msg = JSON.parse(e.data);
+      // after switching plotters, ignore what is still on its way about the previous one
+      if (msg.plotter && this.plotterId && msg.plotter !== this.plotterId) return;
       switch (msg.c) {
         case "pong": {
           // nothing
@@ -232,7 +259,7 @@ export class SaxiDriver extends BaseDriver {
           this.onpause(msg.p.paused);
         } break;
         case "plan": {
-          this.onplan(Plan.fromTransferable(msg.p.motions));
+          this.onplan(Plan.deserialize(msg.p.motions), msg.p.job ?? null);
         } break;
         default: {
           console.log("Unknown message from server:", msg);
@@ -251,26 +278,31 @@ export class SaxiDriver extends BaseDriver {
     });
   }
 
-  public plot(plan: Plan) {
-    // const motions = plan.toTransferable();
-    // this.send({ c: "plot", p: { motions } });
-    fetch("/plot", {
+  /** Called when the server refuses a plot, with its reason. */
+  public onerror: (message: string) => void = () => {};
+
+  public plot(plan: Plan, job?: PlotJobInfo) {
+    fetch(this.url("plot"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(plan.serialize()),
-    });
+      body: JSON.stringify({ plan: plan.serialize(), job }),
+    })
+      .then(async (res) => {
+        if (!res.ok) this.onerror((await res.text()) || `${res.status} ${res.statusText}`);
+      })
+      .catch((e: Error) => this.onerror(e.message));
   }
 
   public cancel() {
-    fetch("/cancel", { method: "POST" });
+    fetch(this.url("cancel"), { method: "POST" });
   }
 
   public pause() {
-    fetch("/pause", { method: "POST" });
+    fetch(this.url("pause"), { method: "POST" });
   }
 
   public resume() {
-    fetch("/resume", { method: "POST" });
+    fetch(this.url("resume"), { method: "POST" });
   }
 
   public send(msg: object) {
@@ -281,14 +313,19 @@ export class SaxiDriver extends BaseDriver {
   }
 
   public setPenHeight(height: number, rate: number) {
-    this.send({ c: "setPenHeight", p: { height, rate } });
+    this.send({ c: "setPenHeight", p: { height, rate, plotter: this.plotterId ?? undefined } });
+  }
+
+  /** HP-GL: pick up a carousel pen (0 puts it away). */
+  public selectPen(pen: number) {
+    this.send({ c: "selectPen", p: { pen, plotter: this.plotterId ?? undefined } });
   }
 
   public limp() {
-    this.send({ c: "limp" });
+    this.send({ c: "limp", p: { plotter: this.plotterId ?? undefined } });
   }
   public changeHardware(hardware: Hardware) {
-    this.send({ c: "changeHardware", p: { hardware } });
+    this.send({ c: "changeHardware", p: { hardware, plotter: this.plotterId ?? undefined } });
   }
   public ping() {
     this.send({ c: "ping" });

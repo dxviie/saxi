@@ -11,6 +11,7 @@ easy-to-use interface, and is exactingly precise.
 - automatically splits apart layers based on SVG stroke colors or group IDs
 - has a web-based UI, so there's no need to muck around with installing X11 and Inkscape
 - can run on a Raspberry Pi or similar, so you don't need to be tethered to your plotter while it plots
+- drives several plotters at once, AxiDraws and HP-GL plotters such as the HP 7475A, each with its own drawing
 
 ![a screenshot of the saxi user interface](docs/saxi.png)
 
@@ -173,9 +174,88 @@ echo dtoverly=dwc2,dr_mode=host | sudo tee -a /boot/config.txt
 ```
 
 
+#### Several plotters
+
+saxi can drive several plotters from one computer, each plotting its own
+drawing at the same time. The **plotters** tab (next to **plot**) lists them
+with what each is plotting, how far it got, a preview of the drawing and a live
+picture from its camera, and lets you pause or cancel any of them. Add plotters
+there: an AxiDraw (or another EiBotBoard machine such as a NextDraw or iDraw)
+or an HP-GL plotter, on one of the serial ports of the computer running saxi.
+
+In the **plot** tab, pick the plotter at the top of the control panel. Each
+plotter keeps its own drawing and settings; its calibration (pen heights,
+speeds, the HP's pen) is stored with the plotter on the server, so every
+browser sees the same.
+
+Several AxiDraws look the same to the computer. Either pick each one by its port
+in the plotter form (on Linux, saxi stores the `/dev/serial/by-…` link), or give
+each board a nickname, which it then reports as its USB serial number, and enter
+that in the form:
+
+```bash
+$ saxi --device /dev/ttyACM0 nickname left-axidraw
+```
+
+(with the saxi server stopped, or that plotter disabled, so the port is free),
+then unplug the AxiDraw and plug it back in. Nicknames need EBB firmware 2.5.5
+or newer, and updating the firmware erases them.
+
+Plotters are kept in `~/.saxi/plotters.json`. Until you add or edit one, saxi
+starts with a single AxiDraw, on the `--device` port or the first one it
+finds, just as before; `--device` keeps setting the port of the first AxiDraw.
+The single-plotter API (`POST /plot`, `/pause`, `/resume`, `/cancel`,
+`GET /plot/status`) drives the first plotter in the list; each plotter has the
+same under `/plotters/<id>/`.
+
+To try saxi without a plotter, add one with the port “simulated plotter”.
+
+#### HP 7475A and other HP-GL plotters
+
+saxi drives HP-GL plotters on a serial port, written for the HP 7475A with its
+RS-232-C interface (Option 001: a 25-pin socket on the back). The HP-IB version
+(Option 002) would need a GPIB adapter and isn't supported.
+
+**Cable.** The plotter is wired like a computer, so it needs a **null-modem**
+cable or adapter between it and a USB-serial adapter: the adapter's transmit
+line must go to the plotter's receive line (pin 3) and the other way round
+(pin 2), plus ground (pin 7). A plain DB9-to-DB25 "modem" cable doesn't work on
+its own: add a DB9 null-modem adapter. saxi paces the data itself, asking the
+plotter how far it got after every chunk and never sending more than its 1 KB
+buffer holds, so no handshake lines are needed. Only tick “hardware handshake on
+CTS” if your cable brings the plotter's DTR (pin 20) to the adapter's CTS.
+
+**Rear switches.** Turn parity off (S1 and S2), set Y/D to D (direct), and
+US/MET to MET for A4 and A3 paper or US for letter and tabloid. The baud rate
+switches (B1–B4) only need to match: leave the baud rate on “detect” in the
+plotter form and saxi tries each rate the plotter offers, then remembers the one
+that answered.
+
+**Paper.** The plotter can't tell what paper is loaded: press SIZE on the front
+panel to pick between A4/A3 (or letter/tabloid with the US switch), and saxi
+reads back what it is set to. A drawing is centred on that paper; saxi warns
+when the drawing's paper is bigger, and starts a new HP plotter on the paper the
+plotter is set to. Portrait drawings are plotted a quarter turn round, since the
+plotter lays every paper out landscape. The pen can't reach the edges of the
+sheet (on A4 it stays 2.5 to 16 mm away, depending on the side), so keep a margin of
+at least 16 mm: saxi's default of 20 mm is fine, and lines beyond the plotter's
+reach are cut off rather than sent.
+
+**Pens.** Choose the carousel pen (1–6) and the drawing speed in the **pen**
+section; the plotter plans its own acceleration, so the other motion settings
+don't apply. Technical pens such as Rotrings in 3D-printed carousel adapters
+want a slow speed: start around 100 mm/s (10 cm/s, the default for a new HP
+plotter) and go lower if lines skip. A pause puts the pen back in the carousel,
+and a cancel clears the plotter's buffer and puts the pen away. A plot uses one
+pen: plot each layer with its own pen.
+
+The 7475A reports where it is as it goes, so the progress shown and the timelapse
+pen triggers follow the plotter itself. **download .hpgl** saves the HP-GL saxi
+would send, to plot it with another tool or check it.
+
 #### Cameras & timelapses
 
-The **camera** tab (next to **plot** in the top left) gives you a live view of
+The **camera** tab (in the top left, next to **plot** and **plotters**) gives you a live view of
 one or more cameras pointed at the plotter, records timelapses of your plots and
 renders them to MP4, much like the camera integration of a 3D printer.
 
@@ -226,7 +306,12 @@ the finished drawing. Frames are triggered by
   duration so that every plot yields a video of roughly the same length.
 
 A camera can have its own trigger (edit the camera), e.g. an overview camera on
-pen lifts and a carriage camera while the pen is down. Since saxi sends motions
+pen lifts and a carriage camera while the pen is down.
+
+With several plotters, choose in each camera's settings which plotters it films
+(all of them by default). Every plotter then records its plots with its own
+cameras, at the same time as the others, and a manual recording is made for the
+plotter you pick. The timelapse library can be filtered by plotter. Since saxi sends motions
 to the plotter well ahead of time, the pen triggers go by when the plotter
 actually gets to each motion, worked out from the plan's timing.
 
@@ -239,7 +324,7 @@ re-rendered later with different settings. Rendering on a Raspberry Pi is slow, 
 preset there or copy the frames elsewhere.
 
 Everything is stored under `~/.saxi` (override with `--data-dir` or
-`SAXI_DATA_DIR`): `cameras.json`, `timelapse.json` and one directory per
+`SAXI_DATA_DIR`): `plotters.json`, `cameras.json`, `timelapse.json` and one directory per
 recording in `timelapses/` containing `<camera>/frame-000001.jpg …`, the rendered
 videos in `renders/`, a `timelapse.json` describing the recording and a
 `timeline.txt` of which camera captured which frame when. Keep an eye

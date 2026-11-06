@@ -138,6 +138,11 @@ export class PlotClock {
   /** Recent spans [from, until) with the pen on the paper; `until` is Infinity until the pen is lifted. */
   private down: Array<[number, number]> = [];
 
+  /** The plotter is getting to the next motion right now (for plotters that report where they are). */
+  public resync(now = Date.now()): void {
+    this.busyUntil = now;
+  }
+
   /** The plotter is busy for `ms` before it gets to the next motion. */
   public wait(ms: number, now = Date.now()): void {
     this.busyUntil = Math.max(now, this.busyUntil) + ms;
@@ -196,6 +201,8 @@ interface TriggerGroup {
 }
 
 interface ActiveSession {
+  /** The plotter recorded ("" for none in particular). */
+  key: string;
   session: TimelapseSession;
   dir: string;
   cameras: Camera[];
@@ -253,11 +260,27 @@ export function alignMoments(timeline: string | null, cameras: TimelapseCameraIn
   return aligned;
 }
 
+/** Which plot a recording is of. */
+export interface PlotContext {
+  plotterId?: string;
+  plotterName?: string;
+  /** Name of the drawing, used to name the recording. */
+  jobName?: string;
+}
+
+export interface RecordingOptions extends PlotContext {
+  source: "plot" | "manual";
+  name?: string;
+  /** Estimated plot duration, used by the targetFrames trigger. */
+  planDurationSeconds?: number;
+}
+
 export class TimelapseRecorder {
   public settings: TimelapseSettings;
   private readonly settingsPath: string;
   private readonly sessionsDir: string;
-  private active: ActiveSession | null = null;
+  /** Recordings in progress, by plotter ("" for one that isn't about a plotter). */
+  private active = new Map<string, ActiveSession>();
   private jobs: RenderJob[] = [];
   private renderQueue: Promise<void> = Promise.resolve();
   private closed = false;
@@ -315,19 +338,20 @@ export class TimelapseRecorder {
     const sessions: TimelapseSession[] = [];
     for (const entry of readdirSync(this.sessionsDir)) {
       if (!SAFE_NAME.test(entry)) continue;
-      const session = this.active?.session.id === entry ? this.active.session : this.readSessionFile(entry);
+      const session = this.liveSession(entry) ?? this.readSessionFile(entry);
       if (session) sessions.push(session);
     }
     return sessions.sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1));
   }
 
   public getSession(id: string): TimelapseSession | null {
-    if (this.active?.session.id === id) return this.active.session;
+    const live = this.liveSession(id);
+    if (live) return live;
     return this.readSessionFile(id);
   }
 
   public async deleteSession(id: string): Promise<boolean> {
-    if (this.active?.session.id === id) throw new TimelapseError("cannot delete a recording in progress", 409);
+    if (this.liveSession(id)) throw new TimelapseError("cannot delete a recording in progress", 409);
     if (this.jobs.some((j) => j.sessionId === id && j.status === "running")) {
       throw new TimelapseError("cannot delete a timelapse while it is rendering", 409);
     }
@@ -359,25 +383,66 @@ export class TimelapseRecorder {
 
   // ----- recording
 
-  public activeSession(): TimelapseSession | null {
-    return this.active?.session ?? null;
+  private liveSession(id: string): TimelapseSession | null {
+    for (const active of this.active.values()) if (active.session.id === id) return active.session;
+    return null;
+  }
+
+  private isActive(active: ActiveSession): boolean {
+    return this.active.get(active.key) === active;
+  }
+
+  /** The recording in progress for a plotter, or with no plotter given the first one. */
+  public activeSession(plotterId?: string): TimelapseSession | null {
+    if (plotterId !== undefined) return this.active.get(plotterId)?.session ?? null;
+    return this.active.values().next().value?.session ?? null;
+  }
+
+  /** Every recording in progress. */
+  public activeSessions(): TimelapseSession[] {
+    return [...this.active.values()].map((a) => a.session);
+  }
+
+  /** The recording a request means: the plotter's, or the only one in progress. */
+  private target(plotterId?: string): ActiveSession {
+    if (plotterId !== undefined) {
+      const active = this.active.get(plotterId);
+      if (!active) throw new TimelapseError("no recording in progress", 409);
+      return active;
+    }
+    if (this.active.size === 0) throw new TimelapseError("no recording in progress", 409);
+    if (this.active.size > 1) throw new TimelapseError("several recordings are in progress: say which plotter", 409);
+    return this.active.values().next().value as ActiveSession;
+  }
+
+  /** Enabled cameras that record `plotterId` (cameras assigned to no plotter record every plotter). */
+  private camerasFor(plotterId: string): Camera[] {
+    return this.cameras
+      .enabled()
+      .filter((c) => plotterId === "" || c.config.plotters.length === 0 || c.config.plotters.includes(plotterId));
   }
 
   /**
    * Start a recording with all enabled cameras.
    * @param planDurationSeconds estimated plot duration, used by the targetFrames trigger.
    */
-  public async start(
-    opts: { source: "plot" | "manual"; name?: string; planDurationSeconds?: number } = { source: "manual" },
-  ): Promise<TimelapseSession> {
+  public async start(opts: RecordingOptions = { source: "manual" }): Promise<TimelapseSession> {
     if (this.closed) throw new TimelapseError("server is shutting down", 503);
-    if (this.active) throw new TimelapseError("a recording is already in progress", 409);
-    const cameras = this.cameras.enabled();
-    if (cameras.length === 0) throw new TimelapseError("no enabled cameras", 400);
+    const key = opts.plotterId ?? "";
+    if (this.active.has(key)) {
+      throw new TimelapseError(
+        `a recording is already in progress${opts.plotterName ? ` for ${opts.plotterName}` : ""}`,
+        409,
+      );
+    }
+    const cameras = this.camerasFor(key);
+    if (cameras.length === 0) {
+      throw new TimelapseError(`no enabled cameras${opts.plotterName ? ` for ${opts.plotterName}` : ""}`, 400);
+    }
 
     const now = new Date();
     const stamp = timestampSlug(now);
-    const rawName = (opts.name ?? "").trim();
+    const rawName = (opts.name ?? "").trim() || (opts.source === "plot" ? (opts.jobName ?? "").trim() : "");
     const name = rawName || `${opts.source} ${now.toLocaleString()}`;
     const id = `${stamp}-${slug(rawName || opts.source)}-${newId().slice(0, 4)}`;
     const triggerOf = (camera: Camera) => camera.config.trigger || this.settings.trigger;
@@ -388,6 +453,8 @@ export class TimelapseRecorder {
       finishedAt: null,
       status: "recording",
       source: opts.source,
+      plotterId: opts.plotterId ?? null,
+      plotterName: opts.plotterName ?? null,
       trigger: this.settings.trigger,
       frameCount: 0,
       cameras: cameras.map((c) => ({
@@ -415,6 +482,7 @@ export class TimelapseRecorder {
       }
     }
     const active: ActiveSession = {
+      key,
       session,
       dir,
       cameras,
@@ -428,7 +496,7 @@ export class TimelapseRecorder {
       stopListening: () => {},
     };
     active.stopListening = this.listenWhileDrawing(active);
-    this.active = active;
+    this.active.set(key, active);
     console.log(`Timelapse ${id}: recording with ${cameras.map((c) => c.config.name).join(", ")}`);
 
     if (opts.source === "plot") {
@@ -441,21 +509,22 @@ export class TimelapseRecorder {
   }
 
   /** Capture a frame from every camera into the active recording. Resolves with the new frame count. */
-  public async snap(): Promise<number> {
-    const active = this.active;
-    if (!active) throw new TimelapseError("no recording in progress", 409);
+  public async snap(plotterId?: string): Promise<number> {
+    const active = this.target(plotterId);
     // Unlike automatic triggers, a manual snapshot waits for captures in flight instead of skipping those cameras.
     await this.idle(active, active.cameras);
-    if (this.active !== active) throw new TimelapseError("recording stopped", 409);
+    if (!this.isActive(active)) throw new TimelapseError("recording stopped", 409);
     const captured = await this.captureSet(active, active.cameras, 0);
     if (!captured) throw new TimelapseError("a capture is already in progress, try again", 429);
     return active.session.frameCount;
   }
 
-  public async stop(status: Exclude<TimelapseStatus, "recording"> = "finished"): Promise<TimelapseSession> {
-    const active = this.active;
-    if (!active) throw new TimelapseError("no recording in progress", 409);
-    this.active = null;
+  public async stop(
+    status: Exclude<TimelapseStatus, "recording"> = "finished",
+    plotterId?: string,
+  ): Promise<TimelapseSession> {
+    const active = this.target(plotterId);
+    this.active.delete(active.key);
     this.detach(active, true);
     // let captures in flight land before releasing the cameras
     await this.idle(active, active.cameras);
@@ -531,7 +600,7 @@ export class TimelapseRecorder {
       const onFrame = (frame: Buffer) => {
         const now = Date.now();
         const clock = active.clock;
-        if (this.active !== active || !clock) return;
+        if (!this.isActive(active) || !clock) return;
         const { minIntervalSeconds, maxIntervalSeconds } = this.settings;
         if (now - lastAt < minIntervalSeconds * 1000) return;
         // the frame was taken a little before it arrived: the pen must have been down all along
@@ -563,7 +632,7 @@ export class TimelapseRecorder {
     for (const camera of free) active.busy.add(camera.config.id);
     try {
       if (delayMs > 0) await sleep(delayMs);
-      if (this.active !== active) return false;
+      if (!this.isActive(active)) return false;
       const results = await Promise.all(
         free.map((camera) =>
           camera
@@ -631,13 +700,14 @@ export class TimelapseRecorder {
   // ----- plot hooks (never throw; plotting must not fail because of a camera)
 
   /** Called just before a plot starts moving. Captures the "blank page" frame when recording. */
-  public async plotStarted(planDurationSeconds: number): Promise<void> {
+  public async plotStarted(planDurationSeconds: number, plot: PlotContext = {}): Promise<void> {
+    const key = plot.plotterId ?? "";
     try {
-      let active = this.active;
+      let active = this.active.get(key);
       if (!active) {
-        if (!this.settings.enabled || this.cameras.enabled().length === 0) return;
-        await this.start({ source: "plot", planDurationSeconds });
-        active = this.active;
+        if (!this.settings.enabled || this.camerasFor(key).length === 0) return;
+        await this.start({ source: "plot", planDurationSeconds, ...plot });
+        active = this.active.get(key);
         if (!active) return;
       } else {
         this.attachPlot(active, planDurationSeconds);
@@ -649,14 +719,18 @@ export class TimelapseRecorder {
   }
 
   /** Called when the plotter is busy for `ms` before its first motion, e.g. moving the pen to its start height. */
-  public plotterBusy(ms: number): void {
-    this.active?.clock?.wait(ms);
+  public plotterBusy(ms: number, plotterId = ""): void {
+    this.active.get(plotterId)?.clock?.wait(ms);
   }
 
-  /** Called for every motion as it is sent to the plotter. */
-  public plotMotion(motion: Motion): void {
-    const active = this.active;
+  /**
+   * Called for every motion as it is sent to the plotter, or with `now` as the plotter gets to it (for plotters
+   * that report where they are).
+   */
+  public plotMotion(motion: Motion, plotterId = "", opts: { now?: boolean } = {}): void {
+    const active = this.active.get(plotterId);
     if (!active?.clock) return;
+    if (opts.now) active.clock.resync();
     const { end } = active.clock.motion(motion);
     if (!(motion instanceof PenMotion) || !(motion.initialPos < motion.finalPos)) return; // only pen lifts
     // The plotter gets to this lift after what is queued before it: capture once the pen is actually up.
@@ -673,8 +747,8 @@ export class TimelapseRecorder {
   }
 
   /** Called once the plot has finished or was cancelled and the machine is idle. */
-  public async plotEnded(cancelled: boolean): Promise<void> {
-    const active = this.active;
+  public async plotEnded(cancelled: boolean, plotterId = ""): Promise<void> {
+    const active = this.active.get(plotterId);
     if (!active?.clock) return;
     try {
       this.detach(active, false);
@@ -682,8 +756,8 @@ export class TimelapseRecorder {
       const cameras = this.pageCameras(active);
       await this.idle(active, cameras);
       await bounded(this.captureSet(active, cameras, this.settings.captureDelayMs), 10000);
-      if (active.session.source === "plot") {
-        await this.stop(cancelled ? "cancelled" : "finished");
+      if (active.session.source === "plot" && this.isActive(active)) {
+        await this.stop(cancelled ? "cancelled" : "finished", active.key);
       }
     } catch (e) {
       console.error(`Timelapse: error finishing recording: ${(e as Error).message}`);
@@ -837,15 +911,14 @@ export class TimelapseRecorder {
 
   public close(): void {
     this.closed = true;
-    if (this.active) {
-      const active = this.active;
-      this.active = null;
+    for (const active of this.active.values()) {
       this.detach(active, true);
       for (const release of active.releases) release();
       active.session.status = "cancelled";
       active.session.finishedAt = new Date().toISOString();
       writeFileSync(path.join(active.dir, "timelapse.json"), `${JSON.stringify(active.session, null, 2)}\n`);
     }
+    this.active.clear();
   }
 }
 
