@@ -127,6 +127,34 @@ describe("HP-GL plotter", () => {
     await plotter.close();
   });
 
+  test("leaves out status checks while position answers are coming", async () => {
+    const checksDuringPlot = async (quietMs: number) => {
+      const port = createSimulatedHpgl({ timeScale: 0.05 });
+      const plotter = await HpglPlotter.connect(port, "sim", { pollMs: 5, quietMs });
+      await plotAll(plotter, testPlan());
+      const checks = port.escapes.filter((e) => e === ".O").length;
+      await plotter.close();
+      return checks;
+    };
+    expect(await checksDuringPlot(0)).toBeGreaterThan(0);
+    expect(await checksDuringPlot(10000)).toBe(0);
+  });
+
+  test("still reports a raised paper lever during a plot", async () => {
+    const port = createSimulatedHpgl({ timeScale: 0.05 });
+    const plotter = await HpglPlotter.connect(port, "sim", { pollMs: 10, quietMs: 50 });
+    const done = plotAll(plotter, testPlan());
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    port.setStatusBits(32);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(plotter.attention).toMatch(/lever/);
+    port.setStatusBits(0);
+    await done;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(plotter.attention).toBeNull();
+    await plotter.close();
+  });
+
   test("notices when the plotter stops answering", async () => {
     const port = createSimulatedHpgl({ timeScale: 0 });
     const plotter = await HpglPlotter.connect(port, "sim", { pollMs: 20 });

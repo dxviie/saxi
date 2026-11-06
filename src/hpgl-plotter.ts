@@ -35,6 +35,12 @@ const HANDSHAKE_WINDOW = 2048;
 const BUFFER_BYTES = 1024;
 /** Instructions are sent in chunks of about this many bytes, each followed by an output instruction. */
 const CHUNK_BYTES = 192;
+/**
+ * How long the plotter must have been quiet before a status check goes out with answers still due. An ESC . O that
+ * lands while the plotter is sending an answer is dropped and flashes its ERROR light (ESC . E says 10), so the check
+ * waits while answers are coming: a plotter that has stopped, with its lever raised or VIEW pressed, has gone quiet.
+ */
+const QUIET_MS = 1000;
 
 const POSITION = /^-?\d+,-?\d+,\d$/; // OA / OC: x,y,pen
 const RECT = /^-?\d+,-?\d+,-?\d+,-?\d+$/; // OH / OP
@@ -59,6 +65,8 @@ export interface HpglPlotterOptions {
   timeoutMs?: number;
   /** How often to check the plotter's status (ESC . O), in ms. 0 turns it off. */
   pollMs?: number;
+  /** Override how long the plotter must be quiet before a status check goes out with answers still due. */
+  quietMs?: number;
 }
 
 /** What the extended status (ESC . O) says needs doing, if anything. */
@@ -120,6 +128,8 @@ export class HpglPlotter implements PlotterDriver {
   private pen = 1;
   private poll: ReturnType<typeof setInterval> | null = null;
   private missedPolls = 0;
+  private readonly quietMs: number;
+  private lastAnswerAt = 0;
   private isClosed = false;
   private markClosed: () => void = () => {};
 
@@ -129,6 +139,7 @@ export class HpglPlotter implements PlotterDriver {
     opts: HpglPlotterOptions,
   ) {
     this.window = opts.windowBytes ?? (opts.rtscts ? HANDSHAKE_WINDOW : DEFAULT_WINDOW);
+    this.quietMs = opts.quietMs ?? QUIET_MS;
     this.writer = port.writable.getWriter();
     this.closed = new Promise((resolve) => {
       this.markClosed = resolve;
@@ -169,6 +180,7 @@ export class HpglPlotter implements PlotterDriver {
   private received(line: string): void {
     if (process.env.DEBUG_SAXI_COMMANDS) console.log(`hpgl read: ${line}`);
     const immediate = NUMBER.test(line);
+    if (!immediate) this.lastAnswerAt = Date.now();
     let i = this.pending.findIndex((p) => p.immediate === immediate && p.matches.test(line));
     if (i < 0) i = this.pending.findIndex((p) => p.matches.test(line));
     if (i < 0) return; // e.g. an answer to an instruction that ESC . K discarded
@@ -234,6 +246,7 @@ export class HpglPlotter implements PlotterDriver {
     if (ms <= 0) return;
     this.poll = setInterval(() => {
       if (this.pending.some((p) => p.immediate)) return; // previous check still waiting
+      if (this.pending.length > 0 && Date.now() - this.lastAnswerAt < this.quietMs) return; // answers are coming
       this.request(`${ESC}.O`, { immediate: true, matches: NUMBER, timeoutMs: ms * 1.5 })
         .then((line) => {
           this.missedPolls = 0;
